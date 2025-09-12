@@ -8,7 +8,6 @@ from dataclasses import dataclass, asdict, fields
 from datetime import datetime, time
 from io import BytesIO
 from typing import Any, Dict, List
-from audio_recorder_streamlit import audio_recorder
 
 # Importar módulos existentes
 from configuracao_teamwork import TEAMWORK_CONFIG
