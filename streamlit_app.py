@@ -568,7 +568,7 @@ def main():
     )
 
     st.title("🤖 Sistema de Anotações Inteligentes")
-    st.markdown("**Versão com Registros Dinâmicos e Integração Teamwork**")
+    st.markdown("**Registros Dinâmicos com Integração Teamwork**")
 
     # Inicializar componentes e estado
     if "ml_analyzer" not in st.session_state:
