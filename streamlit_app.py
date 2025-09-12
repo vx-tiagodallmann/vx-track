@@ -717,7 +717,7 @@ def nova_ficha_servico():
 
     # COL 4 — Tag + Tarefa
     with f4:
-        tag_apontamento = form.text_input("Tag para consulta:", value="apontavel", key=K("tag_input"))
+        tag_apontamento = form.text_input("Tag para consulta:", value="Apontável", key=K("tag_input"))
         if K("_tarefa_opcoes_map") not in st.session_state:
             st.session_state[K("_tarefa_opcoes_map")] = {}
 
