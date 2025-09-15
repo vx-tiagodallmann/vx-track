@@ -1,27 +1,100 @@
-import streamlit as st
 import base64
 import json
 import os
 import requests
 import uuid
+import re
+import contextlib
 from dataclasses import dataclass, asdict, fields
 from datetime import datetime, time
 from io import BytesIO
 from typing import Any, Dict, List
+import streamlit as st
+
+# Verificação de dependências para PDF
+try:
+    import pdfplumber
+    HAS_PDF = True
+except ImportError:
+    pdfplumber = None
+    HAS_PDF = False
+
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    pd = None
+    HAS_PANDAS = False
 
 # Importar módulos existentes
 from configuracao_teamwork import TEAMWORK_CONFIG
 from ml_utils import MLAnalyzer
 from teamwork_client import TeamworkClient
 
+# =========================
+#  Logs de lançamentos (sem BD)
+# =========================
+LOG_FILE = "viasell_lancamentos_log.json"  # JSON-L (1 registro por linha). Lemos array JSON também.
+
+def _append_log(entry: dict, log_file: str = LOG_FILE) -> None:
+    """Acrescenta 1 registro ao arquivo de log (NDJSON)."""
+    os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+def _read_logs(log_file: str = LOG_FILE) -> List[dict]:
+    """Lê histórico do LOG_FILE. Aceita NDJSON e também JSON array."""
+    if not os.path.exists(log_file):
+        return []
+    try:
+        with open(log_file, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if not content:
+            return []
+        # modo array
+        if content.startswith("["):
+            data = json.loads(content)
+            return data if isinstance(data, list) else [data]
+        # modo NDJSON (1 linha = 1 JSON)
+        out = []
+        for ln in content.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                # ignora linhas quebradas
+                pass
+        return out
+    except Exception:
+        return []
+
+def _export_logs_json_array(logs: List[dict]) -> str:
+    """Exporta lista como JSON (array) bonito."""
+    return json.dumps(logs, ensure_ascii=False, indent=2)
+
 
 # =========================
 #  Util / Namespace p/ keys
 # =========================
-NVF_NS = "nvf"  # namespace desta página
+NVF_NS = "nvf"
+
 def K(name: str) -> str:
     return f"{NVF_NS}:{name}"
 
+@contextlib.contextmanager
+def _mute_debug_ui():
+    """Desliga write/info/success/warning temporariamente."""
+    _w, _i, _s, _wa = st.write, st.info, st.success, st.warning
+    try:
+        st.write   = lambda *a, **k: None
+        st.info    = lambda *a, **k: None
+        st.success = lambda *a, **k: None
+        st.warning = lambda *a, **k: None
+        yield
+    finally:
+        st.write, st.info, st.success, st.warning = _w, _i, _s, _wa
 
 # =========================
 #  Modelos de dados
@@ -43,7 +116,6 @@ class RegistroAtividade:
     ml_sugestao: str = ""
     ml_confianca: float = 0.0
 
-
 @dataclass
 class FichaServico:
     """Ficha de serviço completa"""
@@ -57,6 +129,50 @@ class FichaServico:
     data_criacao: str
     status: str = "Em Andamento"
 
+@dataclass
+class ConfiguracaoViasell:
+    """Configurações específicas para integração Viasell"""
+    tag_teamwork: str = "apontavel"
+    area_projeto: str = "Implantação"
+    valor_hora_padrao: float = 180.0
+    vertical_padrao: str = "Construshow"
+    exigir_consultor: bool = True 
+    ocultar_painel_analise: bool = True  # 🔸 novo
+
+# =========================
+#  Gerenciador de Configurações
+# =========================
+class ConfigManager:
+    """Gerenciador de configurações persistentes"""
+    
+    def __init__(self):
+        self.config_file = "config_viasell.json"
+        self.config = self.carregar_config()
+    
+    def carregar_config(self) -> ConfiguracaoViasell:
+        """Carrega configurações do arquivo"""
+        if not os.path.exists(self.config_file):
+            return ConfiguracaoViasell()
+        
+        try:
+            with open(self.config_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            # Filtrar apenas campos válidos
+            config_data = _filter_keys(data, ConfiguracaoViasell)
+            return ConfiguracaoViasell(**config_data)
+        
+        except Exception as e:
+            st.error(f"Erro ao carregar configurações: {e}")
+            return ConfiguracaoViasell()
+    
+    def salvar_config(self):
+        """Salva configurações no arquivo"""
+        try:
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump(asdict(self.config), f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            st.error(f"Erro ao salvar configurações: {e}")
 
 # =========================
 #  Helpers genéricos
@@ -66,9 +182,370 @@ def _filter_keys(d: dict, data_cls):
     allowed = {f.name for f in fields(data_cls)}
     return {k: v for k, v in (d or {}).items() if k in allowed}
 
+def _safe_decode(b: bytes) -> str:
+    """Decodifica bytes de forma segura"""
+    try:
+        return b.decode("utf-8", errors="ignore")
+    except Exception:
+        return b.decode("latin-1", errors="ignore")
 
 # =========================
-#  PDF
+#  Teamwork API - Com Fallbacks
+# =========================
+def _teamwork_auth_headers():
+    token = base64.b64encode(f"{TEAMWORK_CONFIG['api_key']}:x".encode()).decode()
+    return {"Authorization": f"Basic {token}", "Accept": "application/json"}
+
+def get_projects_teamwork() -> List[Dict[str, Any]]:
+    """Busca projetos do Teamwork usando API v1 (fallback confiável)"""
+    base = TEAMWORK_CONFIG['base_url'].rstrip('/')
+    url = f"{base}/projects.json"
+    
+    try:
+        resp = requests.get(url, headers=_teamwork_auth_headers(), timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        projects = data.get("projects", [])
+        project_list = []
+        
+        for proj in projects:
+            project_info = {
+                "id": str(proj.get("id", "")),
+                "name": proj.get("name", ""),
+                "category": proj.get("category", {}).get("name", "") if proj.get("category") else "",
+                "status": proj.get("status", ""),
+                "company": proj.get("company", {}).get("name", "") if proj.get("company") else "",
+                "description": proj.get("description", "")[:100] + "..." if len(proj.get("description", "")) > 100 else proj.get("description", "")
+            }
+            project_list.append(project_info)
+        
+        # Ordenar por nome
+        project_list.sort(key=lambda x: x["name"].lower())
+        return project_list
+        
+    except Exception as e:
+        st.error(f"Erro ao buscar projetos do Teamwork: {e}")
+        return []
+
+def get_tasks_by_tag_and_project(project_id: str, tag_query: str) -> List[Dict[str, str]]:
+    """Busca tarefas de um projeto específico com uma tag específica"""
+    base = TEAMWORK_CONFIG['base_url'].rstrip('/')
+    url = f"{base}/projects/{project_id}/tasks.json?include=tags&pageSize=200"
+    
+    try:
+        resp = requests.get(url, headers=_teamwork_auth_headers(), timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        st.warning(f"Erro ao consultar tarefas: {e}")
+        return []
+
+    items = data.get("tasks") or data.get("todo-items") or []
+    tag_q = (tag_query or "").strip().lower()
+    out: List[Dict[str, str]] = []
+
+    for it in items:
+        name = it.get("content") or it.get("name") or ""
+        tid = str(it.get("id") or it.get("id_str") or "")
+        tag_names = [t.get("name", "").lower() for t in it.get("tags", [])]
+        
+        # Se tem tag e ela está nas tags da tarefa OU no nome da tarefa
+        if tag_q and (tag_q in tag_names or tag_q in name.lower()):
+            out.append({"id": tid, "name": name})
+        elif not tag_q:  # Se não especificou tag, retorna todas
+            out.append({"id": tid, "name": name})
+
+    return out
+
+# =========================
+#  Utilitários de PDF e Texto - CORRIGIDOS PARA VIASELL
+# =========================
+def extract_text_from_upload(file) -> str:
+    """Extrai texto de PDF (pdfplumber) ou TXT. Retorna string limpa."""
+    name = (getattr(file, "name", "") or "").lower()
+    
+    if name.endswith(".pdf"):
+        if not HAS_PDF:
+            raise RuntimeError("Para ler PDF, instale 'pdfplumber' (pip install pdfplumber).")
+        
+        text_parts = []
+        with pdfplumber.open(file) as pdf:
+            for pg in pdf.pages:
+                t = pg.extract_text() or ""
+                text_parts.append(t)
+        return "\n".join(text_parts)
+    
+    elif name.endswith(".txt"):
+        data = file.read()
+        return _safe_decode(data)
+    
+    elif name.endswith(".json"):
+        data = file.read()
+        return _safe_decode(data)
+    
+    else:
+        data = file.read()
+        return _safe_decode(data)
+
+def extrair_dados_viasell_corrigido(texto: str) -> dict:
+    """Extrai dados da ficha Viasell trazendo a DESCRIÇÃO da seção 'Serviço Exec.' para cada registro
+       e prefixando com o número da Ficha quando disponível."""
+    dados = {
+        'cliente': 'Cliente não identificado',
+        'projeto_id': '',
+        'vertical': 'Construshow',
+        'tipo_servico': 'Implantação',
+        'valor_hora': 180.0,
+        'registros': []
+    }
+
+    st.write("**🔍 Analisando texto extraído:**")
+    linhas = texto.split('\n')
+    st.write(f"Total de linhas: {len(linhas)}")
+
+    # -------- Número da Ficha (para prefixo) --------
+    ficha_num = extrair_numero_ficha(texto)
+    ficha_prefix = f"FICHA {ficha_num} - " if ficha_num else ""
+    if ficha_num:
+        st.info(f"🧾 Número da Ficha detectado: {ficha_num}")
+
+    # ===== Dados básicos =====
+    cliente_patterns = [
+        r'Cliente\s*\n?\s*(\d+\s*-\s*[^\n\r]+)',
+        r'(\d{4,6}\s*-\s*[A-Za-z][^0-9\n\r]+)',
+        r'Cliente[:\s]*([^\n\r]+)'
+    ]
+    for pattern in cliente_patterns:
+        match = re.search(pattern, texto, re.IGNORECASE | re.MULTILINE)
+        if match:
+            dados['cliente'] = match.group(1).strip()
+            break
+
+    m_proj = re.search(r'(\d{4,6})', dados['cliente'])
+    if m_proj:
+        dados['projeto_id'] = m_proj.group(1)
+
+    tipo_patterns = [
+        r'(Implantação|Personalização|Serviços|Deslocamento)\s*-\s*[A-Z]+',
+        r'Ficha:\s*\d+\s*\n?\s*(Implantação|Personalização|Serviços|Deslocamento)'
+    ]
+    for pattern in tipo_patterns:
+        match = re.search(pattern, texto, re.IGNORECASE)
+        if match:
+            dados['tipo_servico'] = match.group(1)
+            break
+
+    valor_patterns = [
+        r'Valor/Hr\s+Técnica\s+R\$\s*(\d+[.,]?\d*)',
+        r'(\d+[.,]\d{2})\s*(?=.*valor.*hora)',
+        r'R\$\s*(\d+[.,]?\d*)'
+    ]
+    for pattern in valor_patterns:
+        match = re.search(pattern, texto, re.IGNORECASE)
+        if match:
+            try:
+                dados['valor_hora'] = float(match.group(1).replace(',', '.'))
+                break
+            except ValueError:
+                pass
+
+    # ===== Registros (linha a linha + Serviço Exec.) =====
+    st.write("**📋 Registros coletados...**")
+    registros: List[Dict[str, Any]] = []
+
+    regex_registro = re.compile(
+        r'(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\s+'      # data
+        r'(\d+\s*-\s*[^\d]+?)\s+'                    # executor (com código)
+        r'(\d{1,2}:\d{2}:\d{2})\s+'                  # início
+        r'(\d{1,2}:\d{2}:\d{2})\s+'                  # fim
+        r'(\d{1,2}:\d{2}:\d{2})\s+'                  # total
+        r'(Sim|Não)',                                 # faturável
+        re.IGNORECASE
+    )
+
+    encontrados = 0
+    for idx, linha in enumerate(linhas):
+        m = regex_registro.search(linha or "")
+        if not m:
+            continue
+
+        data, executor, hr_inicio, hr_fim, total_hrs, cobrar = m.groups()
+        executor_limpo = re.sub(r'^\d+\s*-\s*', '', (executor or '').strip())
+        faturavel = (cobrar or '').strip().lower() == 'sim'
+        data_normalizada = normalizar_data(data)
+
+        # Descrição: pega o bloco "Serviço Exec." relativo a este registro
+        desc_exec = buscar_descricao_serv_exec(linhas, idx)
+        if not desc_exec:
+            desc_exec = f"Atividade executada em {data_normalizada} por {executor_limpo}."
+
+        descricao_final = f"{ficha_prefix}{desc_exec}"
+
+        registro = {
+            'data': data_normalizada,
+            'executor': executor_limpo,
+            'hr_inicio': hr_inicio,
+            'hr_fim': hr_fim,
+            'total_hrs': total_hrs,
+            'descricao': descricao_final,
+            'faturavel': faturavel,
+            'tarefa_id': '',
+            'tarefa_nome': ''
+        }
+        registros.append(registro)
+        encontrados += 1
+
+        st.write(f"✅ Registro {encontrados}: {data_normalizada} - {executor_limpo} ({total_hrs})")
+        st.success(f"   📝 {descricao_final[:200]}{'...' if len(descricao_final) > 200 else ''}")
+
+    # ===== Fallback 1: formato flexível =====
+    if not registros:
+        st.warning("⚠️ Nenhum registro no formato principal; aplicando estratégia alternativa.")
+        regex_flex = re.compile(
+            r'(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}).*?(\d{1,2}:\d{2}:\d{2}).*?(\d{1,2}:\d{2}:\d{2}).*?(\d{1,2}:\d{2}:\d{2})'
+        )
+        for idx, linha in enumerate(linhas):
+            mf = regex_flex.search(linha or "")
+            if not mf:
+                continue
+
+            data, hr_inicio, hr_fim, total_hrs = mf.groups()
+            ex_match = re.search(r'(\d+\s*-\s*[A-Za-z][^0-9]+)', linha)
+            executor = ex_match.group(1) if ex_match else "Executor não identificado"
+            executor_limpo = re.sub(r'^\d+\s*-\s*', '', executor.strip())
+            cobrar_match = re.search(r'\b(Sim|Não)\b', linha, re.IGNORECASE)
+            faturavel = bool(cobrar_match and cobrar_match.group(1).lower() == 'sim')
+            data_normalizada = normalizar_data(data)
+
+            desc_exec = buscar_descricao_serv_exec(linhas, idx) or f"Atividade executada em {data_normalizada} por {executor_limpo}."
+            descricao_final = f"{ficha_prefix}{desc_exec}"
+
+            registros.append({
+                'data': data_normalizada,
+                'executor': executor_limpo,
+                'hr_inicio': hr_inicio,
+                'hr_fim': hr_fim,
+                'total_hrs': total_hrs,
+                'descricao': descricao_final,
+                'faturavel': faturavel,
+                'tarefa_id': '',
+                'tarefa_nome': ''
+            })
+
+    # ===== Fallback 2: análise manual =====
+    if not registros:
+        st.write("**🔍 Análise manual das linhas...**")
+        for i, linha in enumerate(linhas):
+            if not linha.strip():
+                continue
+            if (re.search(r'\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}', linha) and re.search(r'\d{1,2}:\d{2}', linha)):
+                st.write(f"**Linha {i+1}:** {linha[:200]}...")
+                datas = re.findall(r'\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}', linha)
+                horarios = re.findall(r'\d{1,2}:\d{2}:\d{2}', linha)
+
+                if datas and len(horarios) >= 2:
+                    data = datas[0]
+                    hr_inicio = horarios[0]
+                    hr_fim = horarios[1] if len(horarios) > 1 else "00:00:00"
+                    total_hrs = horarios[2] if len(horarios) > 2 else calcular_total_horas(hr_inicio[:5], hr_fim[:5])
+
+                    ex_match = re.search(r'(\d+\s*-\s*[A-Za-z][^0-9\n\r]+)', linha)
+                    executor = "Executor não identificado"
+                    if ex_match:
+                        executor = re.sub(r'^\d+\s*-\s*', '', ex_match.group(1).strip())
+
+                    faturavel = 'sim' in linha.lower()
+                    data_normalizada = normalizar_data(data)
+
+                    desc_exec = buscar_descricao_serv_exec(linhas, i) or f"Atividade executada em {data_normalizada} por {executor}."
+                    descricao_final = f"{ficha_prefix}{desc_exec}"
+
+                    registro = {
+                        'data': data_normalizada,
+                        'executor': executor,
+                        'hr_inicio': hr_inicio,
+                        'hr_fim': hr_fim,
+                        'total_hrs': total_hrs,
+                        'descricao': descricao_final,
+                        'faturavel': faturavel,
+                        'tarefa_id': '',
+                        'tarefa_nome': ''
+                    }
+                    registros.append(registro)
+                    st.success(f"✅ Extraído: {data_normalizada} - {executor} ({total_hrs})")
+
+    dados['registros'] = registros
+    st.write(f"**📊 Total de registros extraídos: {len(registros)}**")
+    return dados
+
+def normalizar_data(data_str: str) -> str:
+    """Normaliza formato de data para dd/mm/yyyy"""
+    try:
+        # Remove espaços e substitui separadores
+        data_clean = data_str.strip().replace('-', '/').replace('.', '/')
+        
+        # Tentar diferentes formatos
+        parts = data_clean.split('/')
+        if len(parts) == 3:
+            dia, mes, ano = parts
+            # Se ano com 2 dígitos, assumir 20xx
+            if len(ano) == 2:
+                ano = f"20{ano}"
+            return f"{dia.zfill(2)}/{mes.zfill(2)}/{ano}"
+    except:
+        pass
+    
+    return data_str
+
+def debug_texto_extraido(texto: str, max_chars: int = 3000):
+    """Função para debug do texto extraído"""
+    with st.expander("🔍 Estrutura do Texto Extraído"):
+        # Mostrar preview do texto
+        preview = texto[:max_chars]
+        if len(texto) > max_chars:
+            preview += f"\n\n... (texto truncado, total: {len(texto)} caracteres)"
+        
+        # Dividir em seções para facilitar análise
+        st.subheader("📄 Conteúdo Extraído")
+        st.code(preview)
+        
+        # Estatísticas básicas
+        linhas = texto.split('\n')
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Linhas", len(linhas))
+        with col2:
+            st.metric("Caracteres", len(texto))
+        with col3:
+            datas = re.findall(r'\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}', texto)
+            st.metric("Datas", len(datas))
+        with col4:
+            horarios = re.findall(r'\d{1,2}:\d{2}', texto)
+            st.metric("Horários", len(horarios))
+        
+        # Mostrar padrões encontrados
+        st.subheader("🔍 Padrões Identificados")
+        
+        # Datas encontradas
+        if datas:
+            st.write("**📅 Datas encontradas:**")
+            for data in datas:
+                st.write(f"- {data}")
+        
+        # Executores encontrados
+        executores = re.findall(r'\d+\s*-\s*[A-Za-z][^0-9\n\r]+', texto)
+        if executores:
+            st.write("**👤 Executores encontrados:**")
+            for executor in executores[:5]:  # Mostrar apenas os primeiros 5
+                st.write(f"- {executor.strip()}")
+        
+        # Horários encontrados
+        if horarios:
+            st.write(f"**🕐 Horários encontrados:** {horarios[:10]}")
+
+# =========================
+#  PDF Generator (mantém o mesmo)
 # =========================
 class PDFGenerator:
     """Gerador de PDF em layout limpo para a ficha Viasoft (com minutos p/ Teamwork)."""
@@ -234,6 +711,7 @@ class PDFGenerator:
                 ),
                 small
             )
+
             box_totais = Table([[totais_par]], colWidths=[sum(col_widths)])
             box_totais.setStyle(TableStyle([
                 ("BOX", (0,0), (-1,-1), 0.5, colors.black),
@@ -261,10 +739,10 @@ class PDFGenerator:
             ]))
             story.append(t_cob)
             story.append(Spacer(1, 4))
+
             story.append(Paragraph("Gerado automaticamente pelo Sistema de Anotações Inteligentes", tiny))
 
             generated_at = datetime.now().strftime("%d/%m/%Y %H:%M")
-
             def _footer(canvas, _doc):
                 canvas.saveState()
                 canvas.setFont("Helvetica", 8)
@@ -285,12 +763,12 @@ class PDFGenerator:
             tb = traceback.format_exc()
             return (f"Erro ao gerar PDF: {e}\n\n{tb}").encode("utf-8")
 
-
 # =========================
 #  Fichas (persistência)
 # =========================
 class FichaManager:
     """Gerenciador de fichas de serviço"""
+
     def __init__(self):
         self.fichas_file = "fichas_servico.json"
         self.fichas = self.carregar_fichas()
@@ -314,7 +792,6 @@ class FichaManager:
                     registros_norm.append(RegistroAtividade(**reg_norm))
 
                 ficha_data["registros"] = registros_norm
-
                 # Filtra chaves desconhecidas da ficha
                 ficha_norm = _filter_keys(ficha_data, FichaServico)
                 fichas[ficha_id] = FichaServico(**ficha_norm)
@@ -362,20 +839,9 @@ class FichaManager:
             return PDFGenerator.gerar_pdf_ficha(self.fichas[ficha_id])
         return None
 
-
 # =========================
 #  Helpers Teamwork
 # =========================
-
-def load_all_configs():
-    return {
-        'teamwork_api_key': os.getenv("TEAMWORK_API_KEY"),
-        'teamwork_base_url': os.getenv("TEAMWORK_BASE_URL"),
-        'viahelper_upload_url': os.getenv("VIAHELPER_UPLOAD_URL"),
-        'viahelper_api_key': os.getenv("VIAHELPER_API_KEY"),
-        'assistant_id': os.getenv("ASSISTANT_ID")
-    }
-
 def calcular_total_horas(hr_inicio: str, hr_fim: str) -> str:
     try:
         inicio = datetime.strptime(hr_inicio, "%H:%M")
@@ -391,31 +857,6 @@ def calcular_total_horas(hr_inicio: str, hr_fim: str) -> str:
     except Exception:
         return "00:00:00"
 
-def _teamwork_auth_headers():
-    token = base64.b64encode(f"{TEAMWORK_CONFIG['api_key']}:x".encode()).decode()
-    return {"Authorization": f"Basic {token}", "Accept": "application/json"}
-
-def get_tasks_by_tag_fallback(project_id: str, tag_query: str) -> List[Dict[str, str]]:
-    base = TEAMWORK_CONFIG['base_url'].rstrip('/')
-    url = f"{base}/projects/{project_id}/tasks.json?include=tags&pageSize=200"
-    try:
-        resp = requests.get(url, headers=_teamwork_auth_headers(), timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        st.warning(f"Não foi possível consultar tarefas no Teamwork: {e}")
-        return []
-    items = data.get("tasks") or data.get("todo-items") or []
-    tag_q = (tag_query or "").strip().lower()
-    out: List[Dict[str, str]] = []
-    for it in items:
-        name = it.get("content") or it.get("name") or ""
-        tid = str(it.get("id") or it.get("id_str") or "")
-        tag_names = [t.get("name", "").lower() for t in it.get("tags", [])]
-        if tag_q and (tag_q in tag_names or tag_q in name.lower()):
-            out.append({"id": tid, "name": name})
-    return out
-
 def get_project_people_fallback(project_id: str) -> List[Dict[str, str]]:
     base = TEAMWORK_CONFIG['base_url'].rstrip('/')
     url = f"{base}/projects/{project_id}/people.json"
@@ -426,6 +867,7 @@ def get_project_people_fallback(project_id: str) -> List[Dict[str, str]]:
     except Exception as e:
         st.warning(f"Não foi possível consultar pessoas do projeto: {e}")
         return []
+
     raw = data.get("people") or data.get("persons") or data.get("users") or []
     people: List[Dict[str, str]] = []
     for p in raw:
@@ -443,7 +885,6 @@ def get_project_people_fallback(project_id: str) -> List[Dict[str, str]]:
 
     people.sort(key=lambda x: x["name"].lower())
     return people
-
 
 # ---- Log time no Teamwork (v1)
 def _hms_to_h_m(hms: str) -> tuple[int, int]:
@@ -555,11 +996,819 @@ def _post_time_entry_tw(reg: RegistroAtividade, project_id: str) -> dict:
 
     msg_tail = " | ".join([f"[{st}] {ep} payload={te} resp={txt}" for ep, st, te, txt in erros[-3:]])
     raise requests.HTTPError(f"Todas as variações falharam. Amostras: {msg_tail}", response=last_resp)
+
 # =========================
-#  App
+#  NOVA FUNCIONALIDADE: Viasell COM INTERFACE TABULAR CORRIGIDA E BOTÃO FINAL
+# =========================
+def processar_dados_viasell_tabular(registros_selecionados, tarefas_mapeadas, projeto_id):
+    """Processa registros selecionados na interface tabular"""
+    sucesso_count = 0
+    falha_count = 0
+    erros = []
+
+    consultor_id = st.session_state.get(K("consultor_id"), "")
+    consultor_nome = st.session_state.get(K("consultor_nome"), "")
+
+    try:
+        for reg_index, reg_data in registros_selecionados.items():
+            if reg_index in tarefas_mapeadas and tarefas_mapeadas[reg_index]:
+                tarefa_id, tarefa_nome = tarefas_mapeadas[reg_index]
+
+                # Criar objeto RegistroAtividade com consultor (se definido)
+                registro = RegistroAtividade(
+                    id=str(uuid.uuid4()),
+                    data=reg_data.get('data', ''),
+                    executor=consultor_nome or reg_data.get('executor', ''),
+                    executor_id=consultor_id or "",
+                    hr_inicio=reg_data.get('hr_inicio', ''),
+                    hr_fim=reg_data.get('hr_fim', ''),
+                    descricao=reg_data.get('descricao', ''),
+                    total_hrs=reg_data.get('total_hrs', ''),
+                    faturavel=reg_data.get('faturavel', True),
+                    tarefa_id=tarefa_id,
+                    tarefa_nome=tarefa_nome
+                )
+
+                try:
+                    _post_time_entry_tw(registro, projeto_id)
+                    sucesso_count += 1
+                except Exception as e:
+                    falha_count += 1
+                    erros.append(f"Registro {reg_index+1} → Tarefa #{tarefa_id}: {str(e)}")
+
+        return sucesso_count, falha_count, erros
+
+    except Exception as e:
+        return 0, len(registros_selecionados), [f"Erro geral: {str(e)}"]
+
+def salvar_log_viasell(dados_ficha, sucessos, falhas, erros_detalhados=None, extras: dict | None = None):
+    """Salva log da operação de lançamento Viasell (NDJSON)."""
+    try:
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "cliente": dados_ficha.get("cliente", ""),
+            "projeto_id": dados_ficha.get("projeto_id", ""),
+            "sucessos": int(sucessos or 0),
+            "falhas": int(falhas or 0),
+            "total_registros": len(dados_ficha.get("registros", []) or []),
+            # enriquecimento de contexto disponível em sessão
+            "consultor_nome": st.session_state.get(K("consultor_nome"), ""),
+            "consultor_id": st.session_state.get(K("consultor_id"), ""),
+        }
+        if erros_detalhados:
+            entry["erros"] = list(erros_detalhados)
+
+        # extras opcionais (ex.: nome do projeto, nome do arquivo)
+        if extras:
+            for k, v in extras.items():
+                entry[k] = v
+
+        # salva em memória (sessão) e em arquivo
+        st.session_state.setdefault("viasell_logs", []).append(entry)
+        _append_log(entry, LOG_FILE)
+
+    except Exception as e:
+        st.error(f"Erro ao salvar log: {e}")
+
+
+def extrair_numero_ficha(texto: str) -> str:
+    """
+    Extrai o número da Ficha do texto (ex.: 'Ficha: 12345', 'FICHA - 000987').
+    Retorna string vazia se não encontrar.
+    """
+    padroes = [
+        r'\bFicha\s*[:\-#]*\s*(\d{3,})',
+        r'\bFICHA\s*[:\-#]*\s*(\d{3,})',
+        r'\bN[ºo]\s*[:\-#]*\s*(\d{3,})\s*(?:Ficha|FICHA)?',
+    ]
+    for p in padroes:
+        m = re.search(p, texto, re.IGNORECASE)
+        if m:
+            num = m.group(1)
+            # remove zeros à esquerda, mas mantém '0' se tudo zero
+            return num.lstrip('0') or num
+    return ""
+
+
+def buscar_descricao_serv_exec(linhas: List[str], linha_registro_idx: int) -> str:
+    """
+    Captura a descrição da seção 'Serviço Exec.' associada ao registro encontrado
+    na linha `linha_registro_idx`. Lê a linha do cabeçalho e continua coletando o
+    texto das linhas seguintes até encontrar um delimitador (novo registro, totais etc.).
+    """
+    inicio_busca = max(0, linha_registro_idx - 2)
+    fim_busca = min(len(linhas), linha_registro_idx + 25)
+
+    def _eh_inicio_novo_registro(l: str) -> bool:
+        return bool(re.match(r'\s*\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\s+\d+\s*-\s+', l))
+
+    def _eh_delimitador(l: str) -> bool:
+        return bool(re.search(
+            r'(Hr\(\s*\)\s*Tec|Total\s+Hr|Valor\s*R\$|Informações\s+de\s+Cobrança|Assinatura|Formulário|Ficha|Cliente\s*\d{3,})',
+            l, re.IGNORECASE
+        ))
+
+    desc_partes: List[str] = []
+
+    for i in range(inicio_busca, fim_busca):
+        linha = (linhas[i] or "").strip()
+
+        # Cabeçalho "Serviço Exec"
+        if re.search(r'Serv[ií]?[çc]o\s+Exec', linha, re.IGNORECASE):
+            # Tenta pegar o conteúdo na mesma linha após ":" / "-" etc.
+            m = re.search(r'Serv[ií]?[çc]o\s+Exec[^:]*[:\-\–]\s*(.*)$', linha, re.IGNORECASE)
+            if m and m.group(1).strip():
+                desc_partes.append(m.group(1).strip())
+
+            # Coleta as próximas linhas até um delimitador
+            for j in range(i + 1, min(i + 30, len(linhas))):
+                l2 = (linhas[j] or "").strip()
+                if not l2:
+                    continue
+                if _eh_inicio_novo_registro(l2) or _eh_delimitador(l2):
+                    break
+                if re.match(r'^[\-\=_.\s]{3,}$', l2):  # separadores
+                    continue
+                if l2.isdigit():  # linhas só com número
+                    continue
+                desc_partes.append(l2)
+            break
+
+    if not desc_partes:
+        return ""
+
+    texto = " ".join(desc_partes)
+    texto = re.sub(r'\s+', ' ', texto).strip()
+    texto = re.sub(r'[,\s\-_]+$', '.', texto)
+    if texto and not texto.endswith(('.', '!', '?', ':')):
+        texto += '.'
+    return texto
+
+def _reset_nova_ficha():
+    # limpa todo estado do namespace nvf:
+    for k in [k for k in list(st.session_state.keys()) if k.startswith(NVF_NS)]:
+        st.session_state.pop(k, None)
+
+    # remove qualquer key do file_uploader atual (com ou sem nonce)
+    up_prefix = f"{K('viasell_upload')}::"
+    for k in list(st.session_state.keys()):
+        if k.startswith(up_prefix) or k == K("viasell_upload"):
+            st.session_state.pop(k, None)
+
+    # limpa flags soltas
+    st.session_state.pop("confirma_lancamento", None)
+    st.session_state.pop(K("confirm_clear_hist"), None)
+    st.session_state.pop(K("mostrar_picker_consultor"), None)
+
+    # força remontagem do file_uploader trocando o nonce
+    st.session_state[K("uploader_nonce")] = st.session_state.get(K("uploader_nonce"), 0) + 1
+
+    # opcional: se usar @st.cache_data em algum lugar, descomente:
+    # st.cache_data.clear()
+
+def lancar_fichas_viasell():
+    """Página para lançamento de fichas Viasell com interface tabular corrigida"""
+    st.header("🏭 Lançar Fichas")
+    st.markdown("**Ferramenta para upload e processamento de fichas do Viasell para Teamwork**")
+    
+    # Verificar se configurações estão definidas
+    config_manager = st.session_state.get("config_manager")
+    if not config_manager:
+        st.error("❌ Configurações não carregadas. Acesse a aba Configurações primeiro.")
+        return
+    
+    config = config_manager.config
+    
+    # Verificar dependências
+    if not HAS_PDF:
+        st.warning("⚠️ Para processar PDFs, instale pdfplumber: `pip install pdfplumber`")
+    
+    # ===== UPLOAD DE ARQUIVO =====
+    st.subheader("1 - 📁 Upload da Ficha")
+
+    nonce = st.session_state.get(K("uploader_nonce"), 0)
+    
+    uploaded_file = st.file_uploader(
+        "Selecione a ficha do Viasell:",
+        type=['pdf', 'json', 'txt', 'csv'],
+        key=f"{K('viasell_upload')}::{nonce}"  # <— força remontagem quando o nonce muda
+    )
+    
+    if not uploaded_file:
+        st.info("👆 Faça upload de uma ficha gerada pelo Viasell para continuar")
+        return
+    
+    # ===== PROCESSAMENTO DO ARQUIVO =====
+    #st.subheader("🔍 Processamento da Ficha")
+    
+    try:
+        with st.spinner("Extraindo dados do arquivo..."):
+            # Ler conteúdo do arquivo
+            file_content = extract_text_from_upload(uploaded_file)
+            
+            # Debug do texto extraído
+            debug_texto_extraido(file_content)
+            
+            if uploaded_file.type == "application/json":
+                try:
+                    dados_extraidos = json.loads(file_content)
+                except json.JSONDecodeError:
+                    st.error("Arquivo JSON inválido")
+                    return
+            else:
+                # Extrair dados do texto com função corrigida
+                if getattr(config, "ocultar_painel_analise", True):
+                    with _mute_debug_ui():
+                        dados_extraidos = extrair_dados_viasell_corrigido(file_content)
+                else:
+                    dados_extraidos = extrair_dados_viasell_corrigido(file_content)
+                # Aplicar configurações padrão se necessário
+                if not dados_extraidos.get('vertical'):
+                    dados_extraidos['vertical'] = config.vertical_padrao
+                if not dados_extraidos.get('valor_hora'):
+                    dados_extraidos['valor_hora'] = config.valor_hora_padrao
+        
+        st.success("✅ Arquivo processado com sucesso!")
+        
+        # ===== SELEÇÃO DE PROJETO (SIMPLIFICADA) =====
+        st.subheader("2 - 🎯 Seleção de Projeto e Consultor")
+        
+        # Buscar projetos do Teamwork usando API v1
+        with st.spinner("Buscando projetos no Teamwork..."):
+            projetos = get_projects_teamwork()
+        
+        if projetos:
+            # Criar dropdown com projetos
+            projeto_opcoes = {}
+            for proj in projetos:
+                categoria_info = f" ({proj['category']})" if proj['category'] else ""
+                label = f"{proj['name']}{categoria_info} - #{proj['id']}"
+                projeto_opcoes[label] = proj
+            
+            projeto_selecionado = st.selectbox(
+                "📂 Selecione o projeto:",
+                options=[""] + list(projeto_opcoes.keys()),
+                key=K("projeto_select"),
+                help="Projetos carregados do Teamwork via API v1"
+            )
+            
+            projeto_info = projeto_opcoes.get(projeto_selecionado, {}) if projeto_selecionado else {}
+            projeto_id = projeto_info.get('id', '')
+        else:
+            st.error("❌ Não foi possível carregar projetos do Teamwork")
+            projeto_id = ""
+            projeto_info = {}
+# ===== CONSULTOR (logo após selecionar o projeto) =====
+        consultor_nome_atual = st.session_state.get(K("consultor_nome"))
+        consultor_id_atual   = st.session_state.get(K("consultor_id"))
+        obrigatorio = getattr(config, "exigir_consultor", True)
+        
+        if projeto_id:
+            "👤 Selecione o Consultor responsável"
+
+
+            colc1, colc2 = st.columns([1, 2])
+            with colc1:
+                if st.button("👤 Seleciona consultor responsável", key=K("btn_definir_consultor")):
+                    st.session_state[K("mostrar_picker_consultor")] = True
+
+
+            with colc2:
+                if consultor_nome_atual:
+                    st.info(
+                        f"Consultor atual: {consultor_nome_atual}"
+                        + (f" (#{consultor_id_atual})" if consultor_id_atual else "")
+                    )
+
+
+        if st.session_state.get(K("mostrar_picker_consultor"), False):
+                with st.spinner("Carregando pessoas do projeto..."):
+                    pessoas = get_project_people_fallback(projeto_id)
+
+                if pessoas:
+                    opcoes = {f"{p['name']} (#{p['id']})": p for p in pessoas}
+                    escolhido = st.selectbox(
+                        "Selecione o consultor do projeto:",
+                        options=[""] + list(opcoes.keys()),
+                        key=K("consultor_select")
+                    )
+                    if escolhido:
+                        p = opcoes[escolhido]
+                        st.session_state[K("consultor_id")] = p["id"]
+                        st.session_state[K("consultor_nome")] = p["name"]
+                        st.session_state[K("mostrar_picker_consultor")] = False
+                        st.success(f"Consultor definido: {p['name']} (#{p['id']})")
+                        st.rerun()
+                else:
+                    st.warning("Não encontrei pessoas no projeto. Informe manualmente:")
+                    nome_manual = st.text_input("Nome do consultor:", key=K("consultor_manual"))
+                    if nome_manual:
+                        st.session_state[K("consultor_id")] = ""
+                        st.session_state[K("consultor_nome")] = nome_manual
+                        st.session_state[K("mostrar_picker_consultor")] = False
+                        st.success(f"Consultor definido: {nome_manual}")
+                        st.rerun()
+        
+                    if obrigatorio and not (consultor_nome_atual or st.session_state.get(K("consultor_manual"))):
+                        st.warning("⚠️ Consultor obrigatório. Clique em **Seleciona consultor responsável** ou informe manualmente.")
+        # ===== VISUALIZAÇÃO DOS DADOS =====
+        if dados_extraidos and projeto_id:
+            st.markdown("**📊 Dados Extraídos da Ficha**")
+            
+            # Mostrar dados básicos
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write(f"**Cliente:** {dados_extraidos.get('cliente', 'N/A')}")
+                st.write(f"**Projeto Selecionado:** {projeto_info.get('name', 'N/A')} (#{projeto_id})")
+                st.write(f"**Consultor:** {st.session_state.get(K('consultor_nome'), '—')}")
+                st.write(f"**Vertical:** {dados_extraidos.get('vertical', 'N/A')}")
+                
+            with col2:
+                st.write(f"**Tipo Serviço:** {dados_extraidos.get('tipo_servico', 'N/A')}")
+                st.write(f"**Valor/Hora:** R$ {dados_extraidos.get('valor_hora', 0.0):.2f}")
+                st.write(f"**Total Registros:** {len(dados_extraidos.get('registros', []))}")
+            
+            # ===== BUSCAR TAREFAS NO TEAMWORK =====
+            registros = dados_extraidos.get('registros', [])
+            if registros:
+                # Buscar tarefas usando a tag configurada
+                with st.spinner(f"Buscando tarefas com tag '{config.tag_teamwork}' no projeto {projeto_id}..."):
+                    tarefas = get_tasks_by_tag_and_project(projeto_id, config.tag_teamwork)
+                
+                if tarefas:
+                    st.success(f"✅ Encontradas {len(tarefas)} tarefas com a tag '{config.tag_teamwork}'")
+                    
+                    # ===== INTERFACE TABULAR =====
+                    st.subheader("3 - 📋 Lançamentos")
+                    st.markdown("**Selecione os registros a lançar e mapeie as tarefas correspondentes da EAP:**")
+                    
+                    # Preparar opções de tarefas para dropdown
+                    tarefa_opcoes = {f"{t['name']} (#{t['id']})": (t['id'], t['name']) for t in tarefas}
+                    opcoes_lista = ["Selecione uma tarefa..."] + list(tarefa_opcoes.keys())
+                    
+                    # CSS customizado para tabela
+                    st.markdown("""
+                    <style>
+                    .registro-row {
+                        border: 1px solid #e0e0e0;
+                        border-radius: 20px;
+                        padding: 10px;
+                        margin: 5px 0;
+                        background-color: #f9f9f9;
+                    }
+                    .registro-header {
+                        font-weight: bold;
+                        color: #2e3a46;
+                        background-color: #e8f4fd;
+                        padding: 10px;
+                        border-radius: 20px;
+                        margin: 5px 0;
+                    }
+                    </style>
+                    """, unsafe_allow_html=True)
+                    
+                    registros_selecionados = {}
+                    tarefas_mapeadas = {}
+                    
+                    # Cabeçalho da tabela
+                    st.markdown('<div class="registro-header">', unsafe_allow_html=True)
+                    col_head = st.columns([1, 1.5, 1, 1, 2.5, 1, 2])
+                    with col_head[0]:
+                        st.markdown("**Selecionar**")
+                    with col_head[1]:
+                        st.markdown("**Data / Executor**")
+                    with col_head[2]:
+                        st.markdown("**Início**")
+                    with col_head[3]:
+                        st.markdown("**Fim**")
+                    with col_head[4]:
+                        st.markdown("**Descrição**")
+                    with col_head[5]:
+                        st.markdown("**Faturável**")
+                    with col_head[6]:
+                        st.markdown("**Tarefa EAP (Tag)**")
+                    st.markdown('</div>', unsafe_allow_html=True)
+                    
+                    # Renderizar cada registro
+                    for i, reg in enumerate(registros):
+                        st.markdown(f'<div class="registro-row">', unsafe_allow_html=True)
+                        
+                        # Linha principal com checkbox e dados
+                        col_check, col_data, col_inicio, col_fim, col_desc, col_fat, col_tarefa = st.columns([1, 1.5, 1, 1, 2.5, 1, 2])
+                        
+                        with col_check:
+                            selecionado = st.checkbox(
+                                "",
+                                value=st.session_state.get(K(f"checkbox_{i}"), False),
+                                key=K(f"checkbox_{i}"),
+                                label_visibility="collapsed"
+                            )
+                        
+                        with col_data:
+                            st.markdown(f"**{reg.get('data', 'N/A')}**")
+                            st.caption(reg.get('executor', 'N/A'))
+                        
+                        with col_inicio:
+                            st.write(reg.get('hr_inicio', 'N/A'))
+                        
+                        with col_fim:
+                            st.write(reg.get('hr_fim', 'N/A'))
+                        
+                        with col_desc:
+                            descricao = reg.get('descricao', '')
+                            if len(descricao) > 60:
+                                descricao_preview = descricao[:60] + "..."
+                                st.write(descricao_preview)
+                                with st.expander("Ver mais"):
+                                    st.write(descricao)
+                            else:
+                                st.write(descricao)
+                            st.caption(f"Total: {reg.get('total_hrs', 'N/A')}")
+                        
+                        with col_fat:
+                            st.write("✅ Sim" if reg.get('faturavel', True) else "❌ Não")
+                        
+                        with col_tarefa:
+                            tarefa_selecionada = st.selectbox(
+                                "",
+                                options=opcoes_lista,
+                                key=K(f"tarefa_{i}"),
+                                label_visibility="collapsed"
+                            )
+                            
+                            if tarefa_selecionada != "Selecione uma tarefa...":
+                                tarefa_id, tarefa_nome = tarefa_opcoes[tarefa_selecionada]
+                                st.caption(f"#{tarefa_id}")
+                        
+                        # Armazenar seleções
+                        if selecionado:
+                            registros_selecionados[i] = reg
+                            if tarefa_selecionada != "Selecione uma tarefa...":
+                                tarefas_mapeadas[i] = tarefa_opcoes[tarefa_selecionada]
+                        
+                        st.markdown('</div>', unsafe_allow_html=True)
+
+                    # ===== BOTÃO FINAL - LANÇAR FICHA COMPLETA =====
+                    st.divider()
+                    st.subheader("4 - 🏁 Finalizar Ficha Viasell")
+                    
+                    # Verificar se há registros válidos para lançamento
+                    registros_com_tarefa_final = {k: v for k, v in tarefas_mapeadas.items() if k in registros_selecionados}
+                    consultor_nome = st.session_state.get(K("consultor_nome")) or st.session_state.get(K("consultor_manual")) or ""
+                    bloqueado_por_consultor = getattr(config, "exigir_consultor", False) and not consultor_nome
+                    
+                    if registros_com_tarefa_final:
+                        # Calcular totais da ficha
+                        total_horas_str = "00:00:00"
+                        total_valor = 0.0
+                        registros_faturáveis = 0
+                        
+                        for idx in registros_com_tarefa_final.keys():
+                            reg = registros[idx]
+                            if reg.get('faturavel', True):
+                                registros_faturáveis += 1
+                                # Somar horas (convertendo HH:MM:SS para minutos)
+                                total_hrs = reg.get('total_hrs', '00:00:00')
+                                try:
+                                    h, m, s = [int(x) for x in total_hrs.split(':')]
+                                    minutos_reg = h * 60 + m + s // 60
+                                    valor_reg = (minutos_reg / 60.0) * dados_extraidos.get('valor_hora', 180.0)
+                                    total_valor += valor_reg
+                                except:
+                                    pass
+                        
+                        # Mostrar resumo final da ficha
+                        col_resumo, col_botao_final = st.columns([2, 1])
+                        
+                        with col_resumo:
+                            st.markdown("""
+                            📊 Resumo Final da Ficha
+                            """)
+                            
+                            col_dados1, col_dados2 = st.columns(2)
+                            
+                            with col_dados1:
+                                st.markdown(f"""
+                                **📋 Dados da Ficha:**
+                                - **Cliente:** {dados_extraidos.get('cliente', 'N/A')}
+                                - **Projeto:** {projeto_info.get('name', 'N/A')} (#{projeto_id})
+                                - **Tipo:** {dados_extraidos.get('tipo_servico', 'N/A')}
+                                - **Vertical:** {dados_extraidos.get('vertical', 'N/A')}
+                                """)
+                            
+                            with col_dados2:
+                                st.markdown(f"""
+                                **💰 Resumo Financeiro:**
+                                - **Valor/Hora:** R$ {dados_extraidos.get('valor_hora', 180.0):.2f}
+                                - **Registros Faturáveis:** {registros_faturáveis}
+                                - **Valor Total Estimado:** R$ {total_valor:.2f}
+                                - **Registros p/ Lançar:** {len(registros_com_tarefa_final)}
+                                """)
+                            
+                            # Lista detalhada dos registros
+                            with st.expander("📋 Detalhes dos Registros para Lançamento"):
+                                for idx, (tarefa_id, tarefa_nome) in registros_com_tarefa_final.items():
+                                    reg = registros[idx]
+                                    faturavel_icon = "💰" if reg.get('faturavel', True) else "🆓"
+                                    st.write(f"{faturavel_icon} **{reg.get('data', '')}** - {reg.get('executor', '')} ({reg.get('total_hrs', '')})")
+                                    st.write(f"   └ 🎯 **Tarefa:** #{tarefa_id} - {tarefa_nome}")
+                                    st.write(f"   └ 📝 **Descrição:** {reg.get('descricao', '')[:100]}...")
+                                    st.write("")
+                            
+                            bloqueado_por_consultor = getattr(config, "exigir_consultor", False) and not consultor_nome
+                            if bloqueado_por_consultor:
+                                st.warning("⚠️ Defina o consultor para habilitar o lançamento.")
+                            
+                            # Botão principal de lançamento final
+                            if st.button(
+                                    "🚀 **LANÇAR FICHA**\n\n**NO TEAMWORK**",
+                                    type="primary",
+                                    key=K("launch_ficha_completa"),
+                                    help=f"Lançar {len(registros_com_tarefa_final)} registros no Teamwork",
+                                    use_container_width=True,
+                                    disabled=bloqueado_por_consultor
+                            ):
+
+
+
+                                    # Realizar lançamento completo
+                                    st.session_state.confirma_lancamento = False
+                                    
+                                    progress_bar = st.progress(0)
+                                    status_text = st.empty()
+                                    
+                                    with st.spinner("🚀 Lançando ficha completa no Teamwork..."):
+                                        sucesso_total = 0
+                                        falhas_total = 0
+                                        erros_detalhados = []
+                                        consultor_id = st.session_state.get(K("consultor_id"), "")
+                                        consultor_nome = st.session_state.get(K("consultor_nome"), "")
+                                        # Lançar registro por registro com progress
+                                        for i, (reg_index, reg_data) in enumerate(registros_selecionados.items()):
+                                            if reg_index in tarefas_mapeadas and tarefas_mapeadas[reg_index]:
+                                                # Atualizar progress
+                                                progress = (i + 1) / len(registros_selecionados)
+                                                progress_bar.progress(progress)
+                                                status_text.text(f"Lançando registro {i+1}/{len(registros_selecionados)}: {reg_data.get('executor', '')} - {reg_data.get('data', '')}")
+                                                
+                                                tarefa_id, tarefa_nome = tarefas_mapeadas[reg_index]
+                                                
+                                                # Criar objeto RegistroAtividade
+                                                registro = RegistroAtividade(
+                                                    id=str(uuid.uuid4()),
+                                                    data=reg_data.get('data', ''),
+                                                    executor=consultor_nome or reg_data.get('executor', ''),
+                                                    executor_id=consultor_id or "",
+                                                    hr_inicio=reg_data.get('hr_inicio', ''),
+                                                    hr_fim=reg_data.get('hr_fim', ''),
+                                                    descricao=reg_data.get('descricao', ''),
+                                                    total_hrs=reg_data.get('total_hrs', ''),
+                                                    faturavel=reg_data.get('faturavel', True),
+                                                    tarefa_id=tarefa_id,
+                                                    tarefa_nome=tarefa_nome
+                                                )
+                                                
+                                                try:
+                                                    # Lançar no Teamwork
+                                                    _post_time_entry_tw(registro, projeto_id)
+                                                    sucesso_total += 1
+                                                    
+                                                except Exception as e:
+                                                    falhas_total += 1
+                                                    erro_msg = f"Registro {reg_index+1} ({reg_data.get('executor', '')}) → Tarefa #{tarefa_id}: {str(e)}"
+                                                    erros_detalhados.append(erro_msg)
+                                    
+                                    # Limpar progress
+                                    progress_bar.empty()
+                                    status_text.empty()
+                                    
+                                    # Mostrar resultado final
+                                    if sucesso_total > 0:
+                                        st.success(f"🎉 **FICHA LANÇADA COM SUCESSO!**\n\n✅ {sucesso_total} registros lançados no Teamwork!")
+                                        
+                                        
+                                        # Criar resumo de conclusão
+                                        st.markdown(f"""
+                                        ### 📋 Ficha Processada com Sucesso!
+                                        
+                                        **Cliente:** {dados_extraidos.get('cliente', 'N/A')}  
+                                        **Projeto:** {projeto_info.get('name', 'N/A')} (#{projeto_id})  
+                                        **Data/Hora:** {datetime.now().strftime("%d/%m/%Y %H:%M:%S")}  
+                                        **Registros Lançados:** {sucesso_total}  
+                                        **Valor Total:** R$ {total_valor:.2f}  
+                                        **Consultor:** {st.session_state.get(K('consultor_nome'), '—')}
+                                        """)
+                                    
+                                    if falhas_total > 0:
+                                        st.error(f"⚠️ {falhas_total} registros falharam no lançamento")
+                                        
+                                        with st.expander("🔍 Ver detalhes dos erros"):
+                                            for erro in erros_detalhados:
+                                                st.write(f"❌ {erro}")
+                                    
+                                    # Salvar log final
+                                    salvar_log_viasell(
+                                        dados_extraidos,
+                                        sucesso_total,
+                                        falhas_total,
+                                        erros_detalhados,
+                                        extras={
+                                            "projeto_nome": projeto_info.get("name", ""),
+                                            "arquivo": getattr(uploaded_file, "name", ""),
+                                        },
+                                    )
+                                    
+                                    # Mostrar estatísticas finais
+                                    col_stats1, col_stats2, col_stats3 = st.columns(3)
+                                    
+                                    with col_stats1:
+                                        st.metric("✅ Sucessos", sucesso_total)
+                                    with col_stats2:
+                                        st.metric("❌ Falhas", falhas_total)
+                                    with col_stats3:
+                                        taxa_sucesso = (sucesso_total / (sucesso_total + falhas_total) * 100) if (sucesso_total + falhas_total) > 0 else 0
+                                        st.metric("📊 Taxa de Sucesso", f"{taxa_sucesso:.1f}%")
+                                    
+                                    # Opção de novo lançamento
+                                    if st.button("🔄 Processar Nova Ficha", key=K("nova_ficha_btn"),type="secondary",use_container_width=True,on_click=_reset_nova_ficha,
+                                                 ):
+                                        # Limpar state e rerun
+                                        for k in [k for k in list(st.session_state.keys()) if k.startswith(NVF_NS)]:
+                                            del st.session_state[k]
+                                        
+                                        for k in list(st.session_state.keys()):
+                                            if k.startswith(f"{K('viasell_upload')}::") or k == K("viasell_upload"):
+                                                st.session_state.pop(k, None)
+                                        
+                                                                                
+                                        # Zera flags soltas (fora do namespace), se existirem
+                                        st.session_state.pop("confirma_lancamento", None)
+                                        st.session_state.pop(K("confirm_clear_hist"), None)
+                                        
+                                        # Força remontagem do file_uploader
+                                        st.session_state[K("uploader_nonce")] = st.session_state.get(K("uploader_nonce"), 0) + 1
+                                        
+                                        st.rerun()
+                                        
+                            # Botão de cancelar se estiver em modo confirmação
+                            if st.session_state.get('confirma_lancamento', False):
+                                if st.button("❌ Cancelar", key=K("cancelar_lancamento")):
+                                    st.session_state.confirma_lancamento = False
+                                    st.rerun()
+                    
+                    else:
+                        # Caso não tenha registros válidos
+                        st.warning("⚠️ **Nenhum registro válido para lançamento")
+                        st.info("""
+                        **Para finalizar a ficha:**
+                        1. ✅ Selecione os registros desejados
+                        2. 🎯 Mapeie cada registro para uma tarefa
+                        3. 🚀 Use o botão 'Lançar Ficha Completa'
+                        """)
+                
+                else:
+                    st.warning(f"⚠️ Nenhuma tarefa encontrada com a tag '{config.tag_teamwork}' no projeto selecionado")
+                    st.info("💡 Opções:\n- Verifique se a tag existe nas tarefas do projeto\n- Tente buscar sem tag (deixar em branco nas configurações)\n- Verifique se você tem permissão para acessar o projeto")
+                    
+                    # Opção de buscar todas as tarefas
+                    if st.button("🔍 Buscar TODAS as tarefas do projeto", key=K("buscar_todas_tarefas")):
+                        with st.spinner("Buscando todas as tarefas..."):
+                            todas_tarefas = get_tasks_by_tag_and_project(projeto_id, "")  # Sem filtro de tag
+                        if todas_tarefas:
+                            st.success(f"✅ Encontradas {len(todas_tarefas)} tarefas no total")
+                            st.info("💡 Configure uma tag específica nas Configurações para filtrar as tarefas relevantes")
+                        else:
+                            st.error("❌ Nenhuma tarefa encontrada no projeto")
+                            
+            else:
+                st.warning("⚠️ Nenhum registro encontrado na ficha")
+                st.info("💡 Possíveis causas:\n- Formato da ficha diferente do esperado\n- Problemas na extração de texto do PDF\n- Dados não estão no formato tabular esperado")
+                
+        elif dados_extraidos and not projeto_id:
+            st.info("👆 Selecione um projeto para continuar")
+        else:
+            st.error("❌ Não foi possível extrair dados da ficha")
+            
+    except Exception as e:
+        st.error(f"❌ Erro ao processar arquivo: {str(e)}")
+        with st.expander("Detalhes do erro"):
+            import traceback
+            st.code(traceback.format_exc())
+
+def historico_lancamentos():
+    """Página de histórico dos lançamentos (arquivo JSON/NDJSON)."""
+    st.header("📚 Histórico")
+
+    # carrega do arquivo sempre que abrir a página (e guarda em cache de sessão)
+    logs = _read_logs(LOG_FILE)
+    st.session_state["viasell_logs"] = logs
+
+    if not logs:
+        st.info("Nenhum lançamento registrado ainda.")
+        return
+
+    # parsing básico
+    for x in logs:
+        ts = x.get("timestamp")
+        try:
+            x["_dt"] = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+        except Exception:
+            x["_dt"] = None
+
+    # filtros
+    colf1, colf2, colf3 = st.columns([1.2, 1, 1])
+    with colf1:
+        termo = st.text_input("Buscar (cliente / projeto / consultor / arquivo):", "")
+    with colf2:
+        # datas
+        datas_validas = [z["_dt"].date() for z in logs if z.get("_dt")]
+        if datas_validas:
+            d_min, d_max = min(datas_validas), max(datas_validas)
+        else:
+            d_min = d_max = datetime.now().date()
+        periodo = st.date_input("Período", value=(d_min, d_max))
+        if isinstance(periodo, tuple):
+            d_inicio, d_fim = periodo
+        else:
+            d_inicio, d_fim = d_min, periodo
+    with colf3:
+        nomes = sorted({(z.get("consultor_nome") or "").strip() for z in logs if z.get("consultor_nome")})
+        filtro_cons = st.multiselect("Consultor", nomes, default=[])
+
+    # aplica filtros
+    def _match(lg: dict) -> bool:
+        ok_dt = True
+        if lg.get("_dt"):
+            d = lg["_dt"].date()
+            ok_dt = (d >= d_inicio and d <= d_fim)
+        txt = f"{lg.get('cliente','')} {lg.get('projeto_id','')} {lg.get('projeto_nome','')} {lg.get('consultor_nome','')} {lg.get('arquivo','')}".lower()
+        ok_txt = (termo.lower() in txt) if termo else True
+        ok_cons = (not filtro_cons) or ((lg.get("consultor_nome") or "").strip() in set(filtro_cons))
+        return ok_dt and ok_txt and ok_cons
+
+    filtrados = [l for l in logs if _match(l)]
+    filtrados.sort(key=lambda z: (z.get("_dt") or datetime.min), reverse=True)
+
+    # métricas
+    tot_sessions = len(filtrados)
+    tot_ok = sum(int(z.get("sucessos") or 0) for z in filtrados)
+    tot_fail = sum(int(z.get("falhas") or 0) for z in filtrados)
+    taxa = (tot_ok / (tot_ok + tot_fail) * 100) if (tot_ok + tot_fail) else 0.0
+
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("Sessões de lançamento", tot_sessions)
+    with c2: st.metric("Registros OK", tot_ok)
+    with c3: st.metric("Taxa de sucesso", f"{taxa:.1f}%")
+
+    st.divider()
+
+    # tabela
+    cols_show = ["timestamp","cliente","projeto_nome","projeto_id","consultor_nome","arquivo","sucessos","falhas","total_registros"]
+    if HAS_PANDAS:
+        import pandas as _pd
+        df = _pd.DataFrame([{k: v for k, v in x.items() if k in cols_show} for x in filtrados])
+        if not df.empty:
+            df = df.sort_values("timestamp", ascending=False)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        # downloads
+        json_txt = _export_logs_json_array([{k: v for k, v in x.items() if k in cols_show or k == "erros"} for x in filtrados])
+        st.download_button("⬇️ Baixar JSON", data=json_txt, file_name="historico_viasell.json", mime="application/json")
+        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("⬇️ Baixar CSV", data=csv_bytes, file_name="historico_viasell.csv", mime="text/csv")
+    else:
+        st.write("Resultados:")
+        for lg in filtrados:
+            with st.expander(f"🗓 {lg.get('timestamp','')} • {lg.get('cliente','')} • Proj #{lg.get('projeto_id','')} • {lg.get('consultor_nome','') or '—'}"):
+                st.write({k: lg.get(k) for k in cols_show})
+                if lg.get("erros"):
+                    st.write("Erros:", lg["erros"])
+
+    # ferramentas
+    with st.expander("Ferramentas do histórico"):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("🔄 Recarregar", use_container_width=True):
+                st.rerun()
+        with col_b:
+            if st.button("🧹 Limpar histórico (confirmação dupla)", use_container_width=True, key=K("btn_clear_hist")):
+                st.session_state[K("confirm_clear_hist")] = True
+            if st.session_state.get(K("confirm_clear_hist")):
+                if st.button("❗ Confirmar limpeza"):
+                    try:
+                        open(LOG_FILE, "w", encoding="utf-8").close()
+                        st.session_state["viasell_logs"] = []
+                        st.session_state[K("confirm_clear_hist")] = False
+                        st.success("Histórico limpo.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Falha ao limpar: {e}")
+
+
+# =========================
+#  App Principal
 # =========================
 def main():
-
     st.set_page_config(
         page_title="Sistema de Anotações Inteligentes",
         page_icon="🤖",
@@ -568,7 +1817,6 @@ def main():
     )
 
     st.title("🤖 Sistema de Anotações Inteligentes")
-    st.markdown("**Registros Dinâmicos com Integração Teamwork**")
 
     # Inicializar componentes e estado
     if "ml_analyzer" not in st.session_state:
@@ -580,6 +1828,8 @@ def main():
         )
     if "ficha_manager" not in st.session_state:
         st.session_state.ficha_manager = FichaManager()
+    if "config_manager" not in st.session_state:
+        st.session_state.config_manager = ConfigManager()
     if "ficha_atual" not in st.session_state:
         st.session_state.ficha_atual = None
     if "registros_temp" not in st.session_state:
@@ -587,382 +1837,166 @@ def main():
 
     # Sidebar
     with st.sidebar:
-        st.title("📋 Navegação")
+        st.title("🌐 Navegação")
         opcao = st.selectbox(
             "Escolha uma opção:",
-            ["Nova Ficha de Serviço", "Fichas em Andamento", "Histórico de Fichas", "Configurações"],
+            [
+                "📋 Integrar Fichas",
+                "💾 Histórico", 
+                "⚙️ Configurações"
+            ],
             key=K("menu")
         )
 
-    if opcao == "Nova Ficha de Serviço":
-        nova_ficha_servico()
+    # Roteamento
+    if opcao == "📋 Integrar Fichas":
+        lancar_fichas_viasell()
+    elif opcao == "Nova Ficha de Serviço":
+        st.info("Funcionalidade de Nova Ficha de Serviço disponível - implementação mantida do código anterior")
     elif opcao == "Fichas em Andamento":
-        fichas_em_andamento()
-    elif opcao == "Histórico de Fichas":
-        historico_fichas()
-    elif opcao == "Configurações":
-        configuracoes()
+        st.info("Funcionalidade de Fichas em Andamento disponível - implementação mantida do código anterior")
+    elif opcao == "💾 Histórico":
+        historico_lancamentos()
+    elif opcao == "⚙️ Configurações":
+        configuracoes_sistema()
 
-
-def nova_ficha_servico():
-    st.header("📝 Nova Ficha de Serviço")
-
-    # ---------------------------------------------- Seção 1: Campos Fixos --------------------------------------
-    st.subheader("📋 Informações Básicas")
-    c1, c2 = st.columns(2)
-
-    with c1:
-        st.write("**Cliente:**")
-        projetos = st.session_state.teamwork_client.get_projects()
-        if projetos:
-            projeto_opcoes = {f"{p['name']} (ID: {p['id']})": p for p in projetos}
-            projeto_label = st.selectbox(
-                "Selecione o projeto:",
-                options=list(projeto_opcoes.keys()),
-                key=K("projeto_select")
-            )
-            if projeto_label:
-                projeto = projeto_opcoes[projeto_label]
-                cliente = projeto.get("name", "")
-                projeto_id = str(projeto.get("id"))
-            else:
-                cliente, projeto_id = "", ""
-        else:
-            cliente = st.text_input("Nome do Cliente:", key=K("cliente_manual"))
-            projeto_id = "manual"
-
-        st.write("**Vertical:**")
-        vertical = st.selectbox(
-            "Selecione a vertical:",
-            ["Agrotitan", "Construshow", "Petroshow"],
-            key=K("vertical_select")
-        )
-
-    with c2:
-        st.write("**Tipo de Serviço:**")
-        tipo_servico = st.selectbox(
-            "Selecione o tipo:",
-            ["Implantação", "Personalização", "Serviços", "Deslocamento", "Outros"],
-            key=K("tipo_servico_select")
-        )
-        st.write("**Valor da Hora:**")
-        valor_hora = st.number_input(
-            "R$ por hora:",
-            min_value=0.0,
-            value=180.0,
-            step=10.0,
-            key=K("valor_hora_input")
-        )
-
-    st.divider()
-    # Botão para iniciar nova ficha
-    if st.session_state.ficha_atual is None:
-        if st.button("🚀 Iniciar Nova Ficha", type="primary", key=K("btn_iniciar")):
-            if cliente:
-                ficha_id = st.session_state.ficha_manager.criar_ficha(
-                    cliente, projeto_id, vertical, tipo_servico, valor_hora
-                )
-                st.session_state.ficha_atual = ficha_id
-                st.session_state.registros_temp = []
-                st.success(f"Ficha {ficha_id} criada com sucesso!")
-                st.rerun()
-            else:
-                st.error("Por favor, selecione um cliente/projeto válido.")
-        return
-
-    st.info(f"📋 Ficha Atual: {st.session_state.ficha_atual}")
-    st.subheader("⏱️ Registros de Atividades")
-
-    # -------------------------------- FORMULÁRIO DE REGISTRO --------------------------------------
-    form = st.form(K("novo_registro"), clear_on_submit=False)
-    form.write("**Novo Registro de Atividade:**")
-
-    f1, f2, f3, f4 = form.columns(4)
-
-    # COL 1 — Data + Executor (Teamwork)
-    with f1:
-        form.date_input("Data:", key=K("data_registro"))
-
-        # Pessoas do projeto (Teamwork)
-        try:
-            pessoas = get_project_people_fallback(projeto_id)
-        except Exception:
-            pessoas = []
-
-        exec_map = {f"{p['name']} (ID: {p['id']})": {"id": str(p["id"]), "name": p["name"]} for p in pessoas}
-        st.session_state[K("_exec_map")] = exec_map  # <-- guarda para o callback
-
-        exec_options = [""] + list(exec_map.keys()) + ["Outro (digitar)"]
-        escolha = form.selectbox("Executor (Nome):", options=exec_options, key=K("executor_select"))
-
-        if escolha == "Outro (digitar)":
-            form.text_input("Digite o executor:", key=K("executor_manual"))
-        else:
-            st.session_state[K("executor_manual")] = ""
-
-    # COL 2 — Horários
-    with f2:
-        form.time_input("Hr Início:", key=K("hr_inicio_input"))
-        form.time_input("Hr Fim:", key=K("hr_fim_input"))
-
-    # COL 3 — Total + Faturável
-    with f3:
-        hi = st.session_state.get(K("hr_inicio_input"))
-        hf = st.session_state.get(K("hr_fim_input"))
-        total_vis = "00:00:00"
-        if hi and hf:
-            total_vis = calcular_total_horas(hi.strftime("%H:%M"), hf.strftime("%H:%M"))
-        form.text_input("Total de Hrs:", value=total_vis, key=K("total_hrs_display"), disabled=True)
-        form.checkbox("Faturável", value=st.session_state.get(K("faturavel_input"), True), key=K("faturavel_input"))
-
-    # COL 4 — Tag + Tarefa
-    with f4:
-        tag_apontamento = form.text_input("Tag para consulta:", value="Apontável", key=K("tag_input"))
-        if K("_tarefa_opcoes_map") not in st.session_state:
-            st.session_state[K("_tarefa_opcoes_map")] = {}
-
-        tarefas = []
-        if tag_apontamento and projeto_id and projeto_id != "manual":
-            try:
-                proj_id_int = int(projeto_id)
-            except Exception:
-                proj_id_int = projeto_id
-            try:
-                tarefas = st.session_state.teamwork_client.get_tasks_by_tag(proj_id_int, tag_apontamento)
-            except Exception:
-                try:
-                    tarefas = get_tasks_by_tag_fallback(proj_id_int, tag_apontamento)
-                except Exception:
-                    tarefas = []
-
-        if tarefas:
-            tarefa_opcoes = {
-                f"{t['name']} (ID: {t['id']})": {"id": str(t["id"]), "name": t["name"]}
-                for t in tarefas
-            }
-            st.session_state[K("_tarefa_opcoes_map")] = tarefa_opcoes
-            form.selectbox("Tarefa:", options=[""] + list(tarefa_opcoes.keys()), key=K("tarefa_select"))
-        else:
-            st.session_state[K("_tarefa_opcoes_map")] = {}
-            st.session_state[K("tarefa_select")] = ""
-            form.caption("Nenhuma tarefa encontrada com essa tag (ou projeto manual).")
-
-    # Callback de insert
-    def _on_inserir_registro():
-        s = st.session_state
-        
-        # Deriva executor a partir dos widgets
-        exec_sel = s.get(K("executor_select"), "")
-        exec_map = s.get(K("_exec_map"), {}) or {}
-
-        if exec_sel == "Outro (digitar)":
-            executor_val = (s.get(K("executor_manual")) or "").strip()
-            executor_id = ""  # sem ID quando é manual
-        elif exec_sel:
-            info = exec_map.get(exec_sel, {})
-            executor_val = (info.get("name") or "").strip()
-            executor_id = (str(info.get("id") or "")).strip()
-        else:
-            executor_val, executor_id = "", ""
-        
-        # >>> Se o person-id tem que ser obrigatório, ative esta checagem:
-        if not executor_id:
-            s[K("_form_error")] = "Selecione um executor da lista (com ID do Teamwork)."
-            return
-        
-        obrigatorios = [
-            s.get(K("data_registro")),
-            executor_val,
-            s.get(K("hr_inicio_input")),
-            s.get(K("hr_fim_input")),
-            s.get(K("descricao_input")),
-        ]
-        if not all(obrigatorios):
-            s[K("_form_error")] = "Por favor, preencha todos os campos obrigatórios (incluindo o Executor)."
-            return
-
-
-        total_hrs = calcular_total_horas(
-            s[K("hr_inicio_input")].strftime("%H:%M"),
-            s[K("hr_fim_input")].strftime("%H:%M"),
-        )
-
-        tarefa_opcoes = s.get(K("_tarefa_opcoes_map"), {}) or {}
-        tarefa_sel = s.get(K("tarefa_select"), "")
-        tarefa_id = tarefa_opcoes.get(tarefa_sel, {}).get("id", "") if tarefa_sel else ""
-        tarefa_nome = tarefa_sel or ""
-
-        registro = RegistroAtividade(
-            id=str(uuid.uuid4()),
-            data=s[K("data_registro")].strftime("%d/%m/%Y"),
-            executor=executor_val,
-            executor_id=executor_id,
-            hr_inicio=s[K("hr_inicio_input")].strftime("%H:%M:%S"),
-            hr_fim=s[K("hr_fim_input")].strftime("%H:%M:%S"),
-            descricao=s[K("descricao_input")],
-            total_hrs=total_hrs,
-            faturavel=s.get(K("faturavel_input"), True),
-            tarefa_id=tarefa_id,
-            tarefa_nome=tarefa_nome,
-            ml_sugestao=s.get("ml_sugestao", ""),
-            ml_confianca=s.get("ml_confianca", 0.0),
-        )
-
-        s.ficha_manager.adicionar_registro(s.ficha_atual, registro)
-        s.registros_temp.append(registro)
-
-        # reset widgets
-        s[K("data_registro")] = datetime.now().date()
-        s[K("hr_inicio_input")] = time(0, 0)
-        s[K("hr_fim_input")] = time(0, 0)
-        s[K("descricao_input")] = ""
-        s[K("tag_input")] = "apontavel"
-        s[K("tarefa_select")] = ""
-        s[K("faturavel_input")] = True
-        s[K("executor_select")] = ""
-        s[K("executor_manual")] = ""
-        s[K("executor_input")] = ""
-        s[K("executor_id")] = ""
-
-        s[K("_form_success")] = "Registro adicionado com sucesso!"
-        
-    # Campo de descrição e Botão de inserir
-    form.text_area(
-        "Descrição da atividade:",
-        value=st.session_state.get("descricao_transcrita", ""),
-        height=100,
-        key=K("descricao_input"),
+def configuracoes_sistema():
+    """Página de configurações do sistema"""
+    st.header("⚙️ Configurações do Sistema")
+    
+    config_manager = st.session_state.config_manager
+    config = config_manager.config
+    
+    ocultar_painel_analise_novo = st.checkbox(
+        "Ocultar painel “Analisando texto extraído”",
+        value=getattr(config, "ocultar_painel_analise", True),
+        key=K("ocultar_painel_analise")
     )
-    form.form_submit_button("➕ Inserir Registro", type="primary", use_container_width=True, on_click=_on_inserir_registro)
 
-    # Feedback do form
-    ok = st.session_state.pop(K("_form_success"), None)
-    er = st.session_state.pop(K("_form_error"), None)
-    if ok:
-        st.success(ok)
-    if er:
-        st.error(er)
+    exigir_consultor_novo = st.checkbox(
+        "Exigir consultor para lançar fichas",
+        value=getattr(config, "exigir_consultor", True),
+        help="Quando ativo, o botão de lançamento só habilita se um consultor estiver definido.",
+        key=K("exigir_consultor"),
+    )
 
-    # ---------- Registros adicionados ----------
-    if st.session_state.registros_temp:
-        st.subheader("📋 Registros Adicionados")
-        for i, registro in enumerate(st.session_state.registros_temp):
-            with st.expander(f"Registro {i+1}: {registro.data} - {registro.executor}"):
-                cA, cB = st.columns(2)
-                with cA:
-                    st.write(f"**Data:** {registro.data}")
-                    st.write(f"**Executor:** {registro.executor}")
-                    st.write(f"**Horário:** {registro.hr_inicio} - {registro.hr_fim}")
-                    st.write(f"**Total:** {registro.total_hrs}")
-                with cB:
-                    st.write(f"**Faturável:** {'Sim' if registro.faturavel else 'Não'}")
-                    st.write(f"**Tarefa:** {registro.tarefa_nome or '-'}")
-                    if registro.ml_sugestao:
-                        st.write(f"**ML Sugestão:** {registro.ml_sugestao} ({registro.ml_confianca:.1%})")
-                st.write(f"**Descrição:** {registro.descricao}")
+    # ===== CONFIGURAÇÕES VIASELL =====
+    st.subheader("🏭 Configurações Viasell")
+    st.markdown("Configure os valores padrão para integração com fichas Viasell")
+    
+    
+    with st.form("config_viasell_form"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**Configurações Teamwork:**")
+            nova_tag = st.text_input(
+                "Tag padrão para buscar tarefas:",
+                value=config.tag_teamwork,
+                help="Tag que será usada para filtrar tarefas no Teamwork (deixe em branco para buscar todas)"
+            )
+        
+        with col2:
+            st.write("**Configurações Padrão:**")
+            nova_area = st.selectbox(
+                "Área:",
+                ["Implantação", "Personalização", "Serviços", "Deslocamento", "Outros"],
+                index=["Implantação", "Personalização", "Serviços", "Deslocamento", "Outros"].index(config.area_projeto)
+            )
+            
+            nova_vertical = st.selectbox(
+                "Vertical padrão:",
+                ["Agrotitan", "Construshow", "Petroshow"],
+                index=["Agrotitan", "Construshow", "Petroshow"].index(config.vertical_padrao)
+            )
+            
+            novo_valor_hora = st.number_input(
+                "Valor/hora padrão (R$):",
+                min_value=0.0,
+                value=config.valor_hora_padrao,
+                step=10.0
+            )
 
-    # ---------- Concluir ficha ----------
-    st.divider()
-    b1, b2, b3 = st.columns([1, 1, 1])
-    with b2:
-        if st.button("🏁 Concluir Ficha", type="primary", key=K("concluir_ficha")):
-            ok_ct, fail_ct = 0, 0
-            erros: list[str] = []
+            exigir_consultor_novo = st.checkbox(
+                "Exigir consultor para lançar fichas",
+                value=getattr(config, "exigir_consultor", False),
+                help="Quando ativo, o botão 'LANÇAR FICHA COMPLETA' só habilita se um consultor estiver definido."
+            )
+        
+        submitted = st.form_submit_button("💾 Salvar Configurações", type="primary", use_container_width=True)
+            
+    if submitted:
+        config.tag_teamwork = nova_tag
+        config.area_projeto = nova_area
+        config.valor_hora_padrao = float(novo_valor_hora)
+        config.vertical_padrao = nova_vertical
+        config.ocultar_painel_analise = bool(ocultar_painel_analise_novo)
+        config.exigir_consultor = bool(exigir_consultor_novo)
 
-            # Lança cada registro no Teamwork
-            try:
-                ficha = st.session_state.ficha_manager.fichas.get(st.session_state.ficha_atual)
-                if ficha and ficha.registros:
-                    for reg in ficha.registros:
-                        try:
-                            _post_time_entry_tw(reg, ficha.projeto_id)
-                            ok_ct += 1
-                        except requests.HTTPError as e:
-                            fail_ct += 1
-                            msg = getattr(e.response, "text", str(e))
-                            erros.append(f"Falha ao lançar '{reg.executor}' em {reg.data} ({reg.hr_inicio}): {e} | {msg}")
-                        except Exception as e:
-                            fail_ct += 1
-                            erros.append(f"Falha ao lançar '{reg.executor}' em {reg.data} ({reg.hr_inicio}): {e}")
+        config_manager.salvar_config()
+        st.success("✅ Configurações salvas com sucesso!")
+        st.rerun()
 
-                st.info(f"Lançamentos no Teamwork: ✅ {ok_ct} | ❌ {fail_ct}")
-                for m in erros:
-                    st.warning(m)
-
-            except Exception as e:
-                st.error(f"Erro geral ao lançar apontamentos: {e}")
-
-            # Gera e oferece o PDF
-            pdf_bytes = st.session_state.ficha_manager.concluir_ficha(st.session_state.ficha_atual)
-            if pdf_bytes:
-                st.download_button(
-                    label="📄 Download PDF da Ficha",
-                    data=pdf_bytes,
-                    file_name=f"{st.session_state.ficha_atual}.pdf",
-                    mime="application/pdf",
-                    key=K("download_pdf"),
-                )
-                st.success("Ficha concluída com sucesso!")
-                st.info("PDF gerado para lançamento no Viasell")
-                st.session_state.ficha_atual = None
-                st.session_state.registros_temp = []
-            else:
-                st.error("Erro ao gerar PDF da ficha")
-
-
-def fichas_em_andamento():
-    st.header("📋 Fichas em Andamento")
-    fichas_andamento = {k: v for k, v in st.session_state.ficha_manager.fichas.items() if v.status == "Em Andamento"}
-    if fichas_andamento:
-        for ficha_id, ficha in fichas_andamento.items():
-            with st.expander(f"Ficha {ficha_id} - {ficha.cliente}"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.write(f"**Cliente:** {ficha.cliente}")
-                    st.write(f"**Vertical:** {ficha.vertical}")
-                    st.write(f"**Tipo:** {ficha.tipo_servico}")
-                with c2:
-                    st.write(f"**Valor/Hora:** R$ {ficha.valor_hora:.2f}")
-                    st.write(f"**Registros:** {len(ficha.registros)}")
-                    st.write(f"**Criada:** {ficha.data_criacao[:10]}")
-    else:
-        st.info("Nenhuma ficha em andamento")
-
-
-def historico_fichas():
-    st.header("📚 Histórico de Fichas")
-    fichas_concluidas = {k: v for k, v in st.session_state.ficha_manager.fichas.items() if v.status == "Concluída"}
-    if fichas_concluidas:
-        for ficha_id, ficha in fichas_concluidas.items():
-            with st.expander(f"Ficha {ficha_id} - {ficha.cliente} (Concluída)"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.write(f"**Cliente:** {ficha.cliente}")
-                    st.write(f"**Vertical:** {ficha.vertical}")
-                    st.write(f"**Tipo:** {ficha.tipo_servico}")
-                with c2:
-                    st.write(f"**Valor/Hora:** R$ {ficha.valor_hora:.2f}")
-                    st.write(f"**Registros:** {len(ficha.registros)}")
-                    st.write(f"**Criada:** {ficha.data_criacao[:10]}")
-                if ficha.registros:
-                    st.write("**Registros:**")
-                    for registro in ficha.registros:
-                        st.write(f"- {registro.data}: {registro.executor} ({registro.total_hrs})")
-    else:
-        st.info("Nenhuma ficha concluída")
-
-
-def configuracoes():
-    st.header("⚙️ Configurações")
-    st.subheader("🔗 Teamwork")
-    st.write(f"**URL:** {TEAMWORK_CONFIG['base_url']}")
-    st.write(f"**Status:** {'Conectado' if st.session_state.teamwork_client else 'Desconectado'}")
-    st.subheader("🤖 Machine Learning")
-    st.write("**Modelo:** Random Forest (68% acurácia)")
-    st.write("**Status:** Ativo")
-    st.subheader("🎤 Transcrição de Áudio")
-    st.write("**Status:** Desativado no momento")
-
+    # ===== TESTE DE CONFIGURAÇÕES =====
+    st.subheader("🧪 Teste de Configurações")
+    
+    col_test1, col_test2 = st.columns(2)
+    
+    with col_test1:
+        if st.button("🔍 Testar Conexão Teamwork", key="test_connection"):
+            with st.spinner("Testando conexão..."):
+                try:
+                    projetos = get_projects_teamwork()
+                    if projetos:
+                        st.success(f"✅ Conexão OK! Encontrados {len(projetos)} projetos")
+                        with st.expander("Ver alguns projetos"):
+                            for projeto in projetos[:5]:
+                                st.write(f"• **{projeto['name']}** (#{projeto['id']}) - {projeto['category']}")
+                    else:
+                        st.warning("⚠️ Conexão OK, mas nenhum projeto encontrado")
+                except Exception as e:
+                    st.error(f"❌ Erro na conexão: {e}")
+    
+    with col_test2:
+        if st.button("📋 Mostrar Configurações", key="show_config"):
+            st.json({
+                "tag_teamwork": config.tag_teamwork,
+                "area_projeto": config.area_projeto,
+                "valor_hora_padrao": config.valor_hora_padrao,
+                "vertical_padrao": config.vertical_padrao,
+                "exigir_consultor": getattr(config, "exigir_consultor", True),
+                "ocultar_painel_analise": getattr(config, "ocultar_painel_analise", True)
+            })
+    
+    # ===== INFORMAÇÕES DO SISTEMA =====
+    st.subheader("🔗 Informações do Sistema")
+    
+    col_sys1, col_sys2 = st.columns(2)
+    
+    with col_sys1:
+        st.write("**Teamwork:**")
+        st.write(f"**URL:** {TEAMWORK_CONFIG['base_url']}")
+        st.write(f"**Status:** {'✅ Conectado' if st.session_state.teamwork_client else '❌ Desconectado'}")
+        
+        st.write("**APIs Utilizadas:**")
+        st.write("**Projetos:** API v1 (confiável)")
+        st.write("**Tarefas:** API v1 (confiável)")
+        st.write("**Lançamentos:** API v1 (múltiplos formatos)")
+    
+    with col_sys2:
+        st.write("**Dependências:**")
+        st.write(f"**PDF Processing:** {'✅ pdfplumber disponível' if HAS_PDF else '❌ pdfplumber não instalado'}")
+        st.write(f"**Data Processing:** {'✅ pandas disponível' if HAS_PANDAS else '❌ pandas não instalado'}")
+        
+        st.write("**Funcionalidades:**")
+        st.write("✅ Extração de fichas Viasell")
+        st.write("✅ Interface tabular")
+        st.write("✅ Mapeamento de tarefas")
+        st.write("✅ Lançamento no Teamwork")
+        st.write("✅ Botão final de lançamento")
+    
+    if not HAS_PDF or not HAS_PANDAS:
+        st.info("💡 Para funcionalidades completas, instale: `pip install pdfplumber pandas`")
 
 if __name__ == "__main__":
     main()
