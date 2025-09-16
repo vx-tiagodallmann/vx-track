@@ -1867,22 +1867,9 @@ def configuracoes_sistema():
     config_manager = st.session_state.config_manager
     config = config_manager.config
     
-    ocultar_painel_analise_novo = st.checkbox(
-        "Ocultar painel “Analisando texto extraído”",
-        value=getattr(config, "ocultar_painel_analise", True),
-        key=K("ocultar_painel_analise")
-    )
-
-    exigir_consultor_novo = st.checkbox(
-        "Exigir consultor para lançar fichas",
-        value=getattr(config, "exigir_consultor", True),
-        help="Quando ativo, o botão de lançamento só habilita se um consultor estiver definido.",
-        key=K("exigir_consultor"),
-    )
 
     # ===== CONFIGURAÇÕES VIASELL =====
-    st.subheader("🏭 Configurações Viasell")
-    st.markdown("Configure os valores padrão para integração com fichas Viasell")
+    st.markdown("Configure os valores padrão para integração")
     
     
     with st.form("config_viasell_form"):
@@ -1891,45 +1878,31 @@ def configuracoes_sistema():
         with col1:
             st.write("**Configurações Teamwork:**")
             nova_tag = st.text_input(
-                "Tag padrão para buscar tarefas:",
+                "Tag padrão para buscar tarefas na EAP:",
                 value=config.tag_teamwork,
                 help="Tag que será usada para filtrar tarefas no Teamwork (deixe em branco para buscar todas)"
             )
-        
         with col2:
-            st.write("**Configurações Padrão:**")
-            nova_area = st.selectbox(
-                "Área:",
-                ["Implantação", "Personalização", "Serviços", "Deslocamento", "Outros"],
-                index=["Implantação", "Personalização", "Serviços", "Deslocamento", "Outros"].index(config.area_projeto)
-            )
-            
-            nova_vertical = st.selectbox(
-                "Vertical padrão:",
-                ["Agrotitan", "Construshow", "Petroshow"],
-                index=["Agrotitan", "Construshow", "Petroshow"].index(config.vertical_padrao)
-            )
-            
-            novo_valor_hora = st.number_input(
-                "Valor/hora padrão (R$):",
-                min_value=0.0,
-                value=config.valor_hora_padrao,
-                step=10.0
-            )
-
+            st.write("**Configurações Teamwork:**")
+            "Validações de fluxo:",
             exigir_consultor_novo = st.checkbox(
                 "Exigir consultor para lançar fichas",
                 value=getattr(config, "exigir_consultor", False),
                 help="Quando ativo, o botão 'LANÇAR FICHA COMPLETA' só habilita se um consultor estiver definido."
             )
+
+            ocultar_painel_analise_novo = st.checkbox(
+            "Ocultar painel “Analisando texto extraído”",
+            value=getattr(config, "ocultar_painel_analise", True),
+            key=K("ocultar_painel_analise")
+            )
+
         
+               
         submitted = st.form_submit_button("💾 Salvar Configurações", type="primary", use_container_width=True)
             
     if submitted:
         config.tag_teamwork = nova_tag
-        config.area_projeto = nova_area
-        config.valor_hora_padrao = float(novo_valor_hora)
-        config.vertical_padrao = nova_vertical
         config.ocultar_painel_analise = bool(ocultar_painel_analise_novo)
         config.exigir_consultor = bool(exigir_consultor_novo)
 
