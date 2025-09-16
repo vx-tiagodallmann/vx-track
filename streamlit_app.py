@@ -2059,7 +2059,7 @@ def configuracoes_sistema():
         st.rerun()
 
     # ===== PRÉ-SELEÇÃO DE TAREFAS POR PROJETO (Whitelist) =====
-    st.subheader("🗂 Pré-seleção de tarefas por projeto")
+    st.subheader("Pré-seleção de tarefas por projeto")
 
     with st.expander("Configurar tarefas que podem receber apontamento (por projeto)", expanded=False):
         # 1) Projeto
