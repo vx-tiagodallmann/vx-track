@@ -576,7 +576,7 @@ def normalizar_data(data_str: str) -> str:
     
     return data_str
 
-def debug_texto_extraido(texto: str, max_chars: int = 3000):
+def debug_texto_extraido(texto: str, max_chars: int = 11000):
     """Função para debug do texto extraído"""
     with st.expander("🔍 Estrutura do Texto Extraído"):
         # Mostrar preview do texto
