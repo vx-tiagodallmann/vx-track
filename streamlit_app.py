@@ -5,7 +5,7 @@ import requests
 import uuid
 import re
 import contextlib
-from dataclasses import dataclass, asdict, fields
+from dataclasses import dataclass, asdict, fields,field
 from datetime import datetime, time
 from io import BytesIO
 from typing import Any, Dict, List
@@ -25,6 +25,8 @@ try:
 except ImportError:
     pd = None
     HAS_PANDAS = False
+
+PREFS_FILE = "viasell_task_prefs.json"
 
 # Importar módulos existentes
 from configuracao_teamwork import TEAMWORK_CONFIG
@@ -131,13 +133,14 @@ class FichaServico:
 
 @dataclass
 class ConfiguracaoViasell:
-    """Configurações específicas para integração Viasell"""
     tag_teamwork: str = "apontavel"
     area_projeto: str = "Implantação"
     valor_hora_padrao: float = 180.0
     vertical_padrao: str = "Construshow"
-    exigir_consultor: bool = True 
-    ocultar_painel_analise: bool = True  # 🔸 novo
+    exigir_consultor: bool = True
+    ocultar_painel_analise: bool = True
+    # NOVO: mapa projeto -> {task_id: task_name}
+    tarefas_por_projeto: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
 # =========================
 #  Gerenciador de Configurações
@@ -228,35 +231,110 @@ def get_projects_teamwork() -> List[Dict[str, Any]]:
         st.error(f"Erro ao buscar projetos do Teamwork: {e}")
         return []
 
-def get_tasks_by_tag_and_project(project_id: str, tag_query: str) -> List[Dict[str, str]]:
-    """Busca tarefas de um projeto específico com uma tag específica"""
+def get_tasks_by_tag_and_project(
+    project_id: str,
+    tag_query: str = "",
+    inherit_from_parent: bool = True,
+    include_completed: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Busca tarefas (e subtarefas) de um projeto.
+    - tag_query: se informado, retorna apenas tarefas que tenham a tag (case-insensitive).
+    - inherit_from_parent=True: subtarefas herdarem tags do pai (útil quando só o pai tem a tag).
+    - include_completed=True: inclui tarefas concluídas.
+    Retorna: [{"id": "...", "name": "...", "tags": ["...","..."], "parentId": "..."}]
+    """
     base = TEAMWORK_CONFIG['base_url'].rstrip('/')
-    url = f"{base}/projects/{project_id}/tasks.json?include=tags&pageSize=200"
-    
-    try:
-        resp = requests.get(url, headers=_teamwork_auth_headers(), timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        st.warning(f"Erro ao consultar tarefas: {e}")
-        return []
 
-    items = data.get("tasks") or data.get("todo-items") or []
-    tag_q = (tag_query or "").strip().lower()
-    out: List[Dict[str, str]] = []
+    def _try_fetch(params: Dict[str, str]) -> List[dict]:
+        items_all = []
+        page = 1
+        while True:
+            q = params.copy()
+            q["page"] = str(page)
+            url = f"{base}/projects/{project_id}/tasks.json"
+            try:
+                r = requests.get(url, headers=_teamwork_auth_headers(), params=q, timeout=30)
+                r.raise_for_status()
+                data = r.json() or {}
+            except Exception:
+                # fallback minimalista
+                if "include" in q: q.pop("include", None)
+                if "nestSubTasks" in q: q.pop("nestSubTasks", None)
+                if "status" in q: q.pop("status", None)
+                if "includeCompletedTasks" in q: q.pop("includeCompletedTasks", None)
+                try:
+                    r = requests.get(url, headers=_teamwork_auth_headers(), params=q, timeout=30)
+                    r.raise_for_status()
+                    data = r.json() or {}
+                except Exception:
+                    return []
 
+            items = data.get("tasks") or data.get("todo-items") or []
+            items_all.extend(items)
+
+            # Teamwork v1 não dá um "hasMore" padronizado; paramos se veio menos que o pageSize
+            page_size = int(q.get("pageSize", 200))
+            if len(items) < page_size:
+                break
+            page += 1
+        return items_all
+
+    # primeira tentativa: com tags + subtarefas + completos
+    params_pref = {
+        "include": "tags,subTasks",
+        "nestSubTasks": "true",
+        "pageSize": "500",
+        "status": "all" if include_completed else "active",
+        "includeCompletedTasks": "true" if include_completed else "false",
+    }
+    items = _try_fetch(params_pref)
+    if not items:
+        # segunda: mais simples
+        items = _try_fetch({"include": "tags", "pageSize": "200"})
+
+    # normalizar + achatar subtarefas (se vierem aninhadas)
+    def _collect(item, parent_id=None, parent_tags=None, out=None):
+        if out is None: out = []
+        name = item.get("content") or item.get("name") or ""
+        tid = str(item.get("id") or item.get("id_str") or item.get("taskId") or "")
+        tags = [t.get("name","") for t in (item.get("tags") or []) if t.get("name")]
+        # herança
+        if inherit_from_parent and parent_tags:
+            for t in parent_tags:
+                if t not in tags:
+                    tags.append(t)
+        out.append({
+            "id": tid,
+            "name": name,
+            "tags": tags,
+            "parentId": parent_id or str(item.get("parentTaskId") or ""),
+        })
+        # subtarefas podem vir em "subTasks"
+        for sub in item.get("subTasks") or []:
+            _collect(sub, parent_id=tid, parent_tags=tags, out=out)
+        return out
+
+    flat: List[Dict[str, Any]] = []
     for it in items:
-        name = it.get("content") or it.get("name") or ""
-        tid = str(it.get("id") or it.get("id_str") or "")
-        tag_names = [t.get("name", "").lower() for t in it.get("tags", [])]
-        
-        # Se tem tag e ela está nas tags da tarefa OU no nome da tarefa
-        if tag_q and (tag_q in tag_names or tag_q in name.lower()):
-            out.append({"id": tid, "name": name})
-        elif not tag_q:  # Se não especificou tag, retorna todas
-            out.append({"id": tid, "name": name})
+        _collect(it, out=flat)
 
-    return out
+    # filtro por tag (case-insensitive) se solicitado
+    tag_q = (tag_query or "").strip().lower()
+    if tag_q:
+        flat = [t for t in flat if any(tag_q == (tg or "").lower() for tg in (t.get("tags") or []))]
+
+    # remover duplicatas (pode acontecer quando a API devolve pai + filhos em diferentes páginas)
+    seen = set()
+    dedup = []
+    for t in flat:
+        if t["id"] and t["id"] not in seen:
+            seen.add(t["id"])
+            dedup.append(t)
+
+    # ordenar por nome
+    dedup.sort(key=lambda x: (x.get("name") or "").lower())
+    return dedup
 
 # =========================
 #  Utilitários de PDF e Texto - CORRIGIDOS PARA VIASELL
@@ -997,6 +1075,78 @@ def _post_time_entry_tw(reg: RegistroAtividade, project_id: str) -> dict:
     msg_tail = " | ".join([f"[{st}] {ep} payload={te} resp={txt}" for ep, st, te, txt in erros[-3:]])
     raise requests.HTTPError(f"Todas as variações falharam. Amostras: {msg_tail}", response=last_resp)
 
+PREFS_FILE = "viasell_task_prefs.json"
+
+def _load_task_prefs() -> dict:
+    try:
+        with open(PREFS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_task_prefs(project_id: str, tasks: list[dict], tag: str, apply_tag: bool):
+    prefs = _load_task_prefs()
+    prefs[str(project_id)] = {
+        "tasks": [{"id": t["id"], "name": t["name"]} for t in tasks],
+        "tag": tag,
+        "apply_tag": bool(apply_tag),
+    }
+    with open(PREFS_FILE, "w", encoding="utf-8") as f:
+        json.dump(prefs, f, ensure_ascii=False, indent=2)
+
+def _get_prefs_for_project(project_id: str) -> dict | None:
+    return _load_task_prefs().get(str(project_id))
+
+def get_all_tasks_project(project_id: str) -> list[dict]:
+    """Busca TODAS as tarefas (paginado). Traz 'tags' quando possível."""
+    base = TEAMWORK_CONFIG['base_url'].rstrip('/')
+    headers = _teamwork_auth_headers()
+    all_items = []
+    page = 1
+    while True:
+        # tentativa com tags
+        url = f"{base}/projects/{project_id}/tasks.json?pageSize=200&page={page}&includeCompletedTasks=true&include=tags"
+        try:
+            r = requests.get(url, headers=headers, timeout=25)
+            r.raise_for_status()
+        except Exception:
+            # fallback sem include=tags (evita 400)
+            url = f"{base}/projects/{project_id}/tasks.json?pageSize=200&page={page}&includeCompletedTasks=true"
+            r = requests.get(url, headers=headers, timeout=25)
+            r.raise_for_status()
+
+        data = r.json()
+        items = data.get("tasks") or data.get("todo-items") or []
+        if not items:
+            break
+        all_items.extend(items)
+        if len(items) < 200:
+            break
+        page += 1
+    return all_items
+
+def _filter_tasks_by_tag(items: list[dict], tag: str) -> list[dict]:
+    """Mantém tarefas cujo nome contenha a tag OU tenham a tag em items[].tags[].name."""
+    tag_l = (tag or "").strip().lower()
+    if not tag_l:
+        # normaliza saída (id + name)
+        return [{"id": str(i.get("id") or i.get("id_str") or ""), "name": (i.get("content") or i.get("name") or "")} for i in items]
+    out = []
+    for i in items:
+        name = (i.get("content") or i.get("name") or "")
+        tid  = str(i.get("id") or i.get("id_str") or "")
+        tag_names = [t.get("name","").lower() for t in i.get("tags", [])]
+        if tag_l in name.lower() or tag_l in tag_names:
+            out.append({"id": tid, "name": name})
+    # dedup por id
+    seen, dedup = set(), []
+    for t in out:
+        if t["id"] and t["id"] not in seen:
+            seen.add(t["id"]); dedup.append(t)
+    return dedup
+
+
+
 # =========================
 #  NOVA FUNCIONALIDADE: Viasell COM INTERFACE TABULAR CORRIGIDA E BOTÃO FINAL
 # =========================
@@ -1334,7 +1484,7 @@ def lancar_fichas_viasell():
             if registros:
                 # Buscar tarefas usando a tag configurada
                 with st.spinner(f"Buscando tarefas com tag '{config.tag_teamwork}' no projeto {projeto_id}..."):
-                    tarefas = get_tasks_by_tag_and_project(projeto_id, config.tag_teamwork)
+                    tarefas = get_tasks_by_tag_and_project(projeto_id, config.tag_teamwork,inherit_from_parent=True)
                 
                 if tarefas:
                     st.success(f"✅ Encontradas {len(tarefas)} tarefas com a tag '{config.tag_teamwork}'")
@@ -1863,58 +2013,153 @@ def main():
 def configuracoes_sistema():
     """Página de configurações do sistema"""
     st.header("⚙️ Configurações do Sistema")
-    
+
     config_manager = st.session_state.config_manager
     config = config_manager.config
-    
 
-    # ===== CONFIGURAÇÕES VIASELL =====
+    # Garante campo no config (evita KeyError/AttributeError)
+    if not hasattr(config, "tarefas_por_projeto") or not isinstance(getattr(config, "tarefas_por_projeto"), dict):
+        config.tarefas_por_projeto = {}
+
+    # ===== CONFIGURAÇÕES GERAIS =====
     st.markdown("Configure os valores padrão para integração")
-    
-    
-    with st.form("config_viasell_form"):
+
+    with st.form(K("config_viasell_form")):
         col1, col2 = st.columns(2)
-        
+
         with col1:
             st.write("**Configurações Teamwork:**")
             nova_tag = st.text_input(
                 "Tag padrão para buscar tarefas na EAP:",
-                value=config.tag_teamwork,
+                value=getattr(config, "tag_teamwork", ""),
                 help="Tag que será usada para filtrar tarefas no Teamwork (deixe em branco para buscar todas)"
             )
+
         with col2:
-            st.write("**Configurações Teamwork:**")
-            "Validações de fluxo:",
+            st.write("**Validações de fluxo:**")
             exigir_consultor_novo = st.checkbox(
                 "Exigir consultor para lançar fichas",
                 value=getattr(config, "exigir_consultor", False),
                 help="Quando ativo, o botão 'LANÇAR FICHA COMPLETA' só habilita se um consultor estiver definido."
             )
-
             ocultar_painel_analise_novo = st.checkbox(
-            "Ocultar painel “Analisando texto extraído”",
-            value=getattr(config, "ocultar_painel_analise", True),
-            key=K("ocultar_painel_analise")
+                "Ocultar painel “Analisando texto extraído”",
+                value=getattr(config, "ocultar_painel_analise", True),
+                key=K("ocultar_painel_analise")
             )
 
-        
-               
         submitted = st.form_submit_button("💾 Salvar Configurações", type="primary", use_container_width=True)
-            
+
     if submitted:
         config.tag_teamwork = nova_tag
-        config.ocultar_painel_analise = bool(ocultar_painel_analise_novo)
         config.exigir_consultor = bool(exigir_consultor_novo)
-
+        config.ocultar_painel_analise = bool(ocultar_painel_analise_novo)
         config_manager.salvar_config()
         st.success("✅ Configurações salvas com sucesso!")
         st.rerun()
 
+    # ===== PRÉ-SELEÇÃO DE TAREFAS POR PROJETO (Whitelist) =====
+    st.subheader("🗂 Pré-seleção de tarefas por projeto")
+
+    with st.expander("Configurar tarefas que podem receber apontamento (por projeto)", expanded=False):
+        # 1) Projeto
+        with st.spinner("Carregando projetos..."):
+            projetos_cfg = get_projects_teamwork()
+
+        mapa_proj = {f"{p['name']} (#{p['id']})": p["id"] for p in (projetos_cfg or [])}
+        label_proj_sel = st.selectbox(
+            "Projeto",
+            options=[""] + list(mapa_proj.keys()),
+            key=K("whitelist_proj_select")
+        )
+        proj_id_sel = mapa_proj.get(label_proj_sel, "")
+
+        if proj_id_sel:
+            st.caption("Dica: esta busca é feita só aqui nas Configurações; no fluxo principal o app usa o que ficar salvo 👍")
+
+            # 2) Filtros e Ação
+            colf = st.columns([1, 1, 2])
+            with colf[1]:
+                filtro_tag_cfg = st.text_input(
+                    "Filtro por tag (opcional)",
+                    value=getattr(config, "tag_teamwork", ""),
+                    key=K("whitelist_tag_filter")
+                )
+            with colf[2]:
+                filtro_txt = st.text_input("Filtro por nome (opcional)", key=K("whitelist_filter_name"))
+            with colf[0]:
+                do_fetch = st.button("🔄 Carregar/Atualizar tarefas", key=K("whitelist_fetch_btn"))
+
+            # 3) Cache por projeto + tag (evita refetch a cada rerun)
+            cache_key = K(f"whitelist_cache::{proj_id_sel}::{(filtro_tag_cfg or '').strip().lower()}")
+            tarefas_opcoes = st.session_state.get(cache_key, [])
+
+            if do_fetch or not tarefas_opcoes:
+                with st.spinner("Buscando tarefas do projeto..."):
+                    # assinatura segura já existente
+                    fetched = get_tasks_by_tag_and_project(
+                        proj_id_sel,
+                        tag_query=(filtro_tag_cfg or "").strip()
+                    ) or []
+                    # Normaliza para {id, name}
+                    tarefas_opcoes = [{"id": str(t.get("id") or ""), "name": t.get("name") or ""} for t in fetched]
+                st.session_state[cache_key] = tarefas_opcoes
+
+            # 4) Aplica filtro por texto no nome (client-side)
+            if filtro_txt:
+                ft = filtro_txt.lower()
+                tarefas_opcoes = [t for t in tarefas_opcoes if ft in (t["name"] or "").lower()]
+
+            tarefas_dict = {f"{t['name']} (#{t['id']})": (t["id"], t["name"]) for t in tarefas_opcoes if t.get("id")}
+            st.caption(f"{len(tarefas_dict)} tarefas listadas após filtro")
+
+            # 5) Pré-seleção atual do projeto
+            selecionadas_map: dict = (config.tarefas_por_projeto.get(proj_id_sel) or {})
+            preselect_labels = [lbl for lbl, (tid, _) in tarefas_dict.items() if tid in selecionadas_map]
+
+            escolhas = st.multiselect(
+                "Selecione as tarefas que poderão receber apontamento",
+                options=list(tarefas_dict.keys()),
+                default=preselect_labels,
+                key=K("whitelist_multiselect"),
+                help="A seleção fica salva no config. No upload da ficha, usaremos esta lista diretamente."
+            )
+
+            colb = st.columns(3)
+            with colb[0]:
+                if st.button("💾 Salvar seleção para este projeto", type="primary", key=K("whitelist_save_btn")):
+                    novo_map = {}
+                    for lbl in escolhas:
+                        tid, tname = tarefas_dict[lbl]
+                        novo_map[tid] = tname
+                    config.tarefas_por_projeto[proj_id_sel] = novo_map
+                    config_manager.salvar_config()
+                    st.success(f"Salvo: {len(novo_map)} tarefas para o projeto #{proj_id_sel}")
+
+            with colb[1]:
+                if st.button("🧹 Limpar seleção do projeto", key=K("whitelist_clear_btn")):
+                    config.tarefas_por_projeto[proj_id_sel] = {}
+                    config_manager.salvar_config()
+                    st.info("Seleção do projeto limpa.")
+
+            with colb[2]:
+                if st.button("📝 Sincronizar nomes (IDs mantidos)", key=K("whitelist_resync_names_btn")):
+                    # Atualiza os nomes salvos conforme últimas opções carregadas
+                    cache = {t["id"]: t["name"] for t in tarefas_opcoes}
+                    atual = config.tarefas_por_projeto.get(proj_id_sel, {}) or {}
+                    for tid in list(atual.keys()):
+                        if tid in cache:
+                            atual[tid] = cache[tid]
+                    config.tarefas_por_projeto[proj_id_sel] = atual
+                    config_manager.salvar_config()
+                    st.success("Nomes sincronizados a partir da API (IDs inalterados).")
+        else:
+            st.info("Selecione um projeto para listar e salvar tarefas.")
+
     # ===== TESTE DE CONFIGURAÇÕES =====
     st.subheader("🧪 Teste de Configurações")
-    
     col_test1, col_test2 = st.columns(2)
-    
+
     with col_test1:
         if st.button("🔍 Testar Conexão Teamwork", key="test_connection"):
             with st.spinner("Testando conexão..."):
@@ -1924,50 +2169,45 @@ def configuracoes_sistema():
                         st.success(f"✅ Conexão OK! Encontrados {len(projetos)} projetos")
                         with st.expander("Ver alguns projetos"):
                             for projeto in projetos[:5]:
-                                st.write(f"• **{projeto['name']}** (#{projeto['id']}) - {projeto['category']}")
+                                st.write(f"• **{projeto['name']}** (#{projeto['id']}) - {projeto.get('category','')}")
                     else:
                         st.warning("⚠️ Conexão OK, mas nenhum projeto encontrado")
                 except Exception as e:
                     st.error(f"❌ Erro na conexão: {e}")
-    
+
     with col_test2:
         if st.button("📋 Mostrar Configurações", key="show_config"):
             st.json({
-                "tag_teamwork": config.tag_teamwork,
-                "area_projeto": config.area_projeto,
-                "valor_hora_padrao": config.valor_hora_padrao,
-                "vertical_padrao": config.vertical_padrao,
-                "exigir_consultor": getattr(config, "exigir_consultor", True),
-                "ocultar_painel_analise": getattr(config, "ocultar_painel_analise", True)
+                "tag_teamwork": getattr(config, "tag_teamwork", ""),
+                "exigir_consultor": getattr(config, "exigir_consultor", False),
+                "ocultar_painel_analise": getattr(config, "ocultar_painel_analise", True),
+                "tarefas_por_projeto": {k: list(v.keys()) for k, v in (config.tarefas_por_projeto or {}).items()}
             })
-    
+
     # ===== INFORMAÇÕES DO SISTEMA =====
     st.subheader("🔗 Informações do Sistema")
-    
     col_sys1, col_sys2 = st.columns(2)
-    
+
     with col_sys1:
         st.write("**Teamwork:**")
         st.write(f"**URL:** {TEAMWORK_CONFIG['base_url']}")
         st.write(f"**Status:** {'✅ Conectado' if st.session_state.teamwork_client else '❌ Desconectado'}")
-        
         st.write("**APIs Utilizadas:**")
-        st.write("**Projetos:** API v1 (confiável)")
-        st.write("**Tarefas:** API v1 (confiável)")
-        st.write("**Lançamentos:** API v1 (múltiplos formatos)")
-    
+        st.write("• **Projetos:** API v1 (confiável)")
+        st.write("• **Tarefas:** API v1 (confiável)")
+        st.write("• **Lançamentos:** API v1 (múltiplos formatos)")
+
     with col_sys2:
         st.write("**Dependências:**")
-        st.write(f"**PDF Processing:** {'✅ pdfplumber disponível' if HAS_PDF else '❌ pdfplumber não instalado'}")
-        st.write(f"**Data Processing:** {'✅ pandas disponível' if HAS_PANDAS else '❌ pandas não instalado'}")
-        
+        st.write(f"• **PDF Processing:** {'✅ pdfplumber disponível' if HAS_PDF else '❌ pdfplumber não instalado'}")
+        st.write(f"• **Data Processing:** {'✅ pandas disponível' if HAS_PANDAS else '❌ pandas não instalado'}")
         st.write("**Funcionalidades:**")
         st.write("✅ Extração de fichas Viasell")
         st.write("✅ Interface tabular")
         st.write("✅ Mapeamento de tarefas")
         st.write("✅ Lançamento no Teamwork")
         st.write("✅ Botão final de lançamento")
-    
+
     if not HAS_PDF or not HAS_PANDAS:
         st.info("💡 Para funcionalidades completas, instale: `pip install pdfplumber pandas`")
 
