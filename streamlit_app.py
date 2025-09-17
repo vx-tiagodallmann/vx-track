@@ -339,6 +339,29 @@ def get_tasks_by_tag_and_project(
 # =========================
 #  Utilitários de PDF e Texto - CORRIGIDOS PARA VIASELL
 # =========================
+def _hms_to_seconds_safe(hms: str) -> int:
+    """'HH:MM[:SS]' -> segundos (tolerante)."""
+    if not hms:
+        return 0
+    parts = [int(p) for p in hms.split(":")]
+    if len(parts) == 2:
+        h, m = parts; s = 0
+    elif len(parts) >= 3:
+        h, m, s = parts[:3]
+    else:
+        return 0
+    return h*3600 + m*60 + s
+
+def _seconds_to_hms(total: int) -> str:
+    """segundos -> 'HH:MM:SS'."""
+    total = max(0, int(total or 0))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+
 def extract_text_from_upload(file) -> str:
     """Extrai texto de PDF (pdfplumber) ou TXT. Retorna string limpa."""
     name = (getattr(file, "name", "") or "").lower()
@@ -576,7 +599,7 @@ def normalizar_data(data_str: str) -> str:
     
     return data_str
 
-def debug_texto_extraido(texto: str, max_chars: int = 11000):
+def debug_texto_extraido(texto: str, max_chars: int = 10000):
     """Função para debug do texto extraído"""
     with st.expander("🔍 Estrutura do Texto Extraído"):
         # Mostrar preview do texto
@@ -1294,6 +1317,7 @@ def buscar_descricao_serv_exec(linhas: List[str], linha_registro_idx: int) -> st
         texto += '.'
     return texto
 
+
 def _reset_nova_ficha():
     # limpa todo estado do namespace nvf:
     for k in [k for k in list(st.session_state.keys()) if k.startswith(NVF_NS)]:
@@ -1408,6 +1432,32 @@ def lancar_fichas_viasell():
             st.error("❌ Não foi possível carregar projetos do Teamwork")
             projeto_id = ""
             projeto_info = {}
+
+        # ===== CALCULAR TOTAIS (FATURADAS x NÃO FATURADAS) =====
+            valor_hora_cfg = float(dados_extraidos.get('valor_hora', 180.0))
+
+            seg_faturaveis = 0
+            seg_nao_faturaveis = 0
+            registros_faturaveis = 0
+
+            for idx in registros_com_tarefa_final.keys():
+                reg = registros[idx]
+                seg = _hms_to_seconds_safe(reg.get('total_hrs', '00:00:00'))
+                if reg.get('faturavel', True):
+                    registros_faturaveis += 1
+                    seg_faturaveis += seg
+                else:
+                    seg_nao_faturaveis += seg
+
+            seg_total = seg_faturaveis + seg_nao_faturaveis
+
+#----------------- Valor considera apenas horas faturáveis
+            horas_faturaveis = seg_faturaveis / 3600.0
+            valor_total = horas_faturaveis * valor_hora_cfg
+
+            hms_fat  = _seconds_to_hms(seg_faturaveis)
+            hms_nfat = _seconds_to_hms(seg_nao_faturaveis)
+            hms_tot  = _seconds_to_hms(seg_total)
 # ===== CONSULTOR (logo após selecionar o projeto) =====
         consultor_nome_atual = st.session_state.get(K("consultor_nome"))
         consultor_id_atual   = st.session_state.get(K("consultor_id"))
@@ -1627,7 +1677,30 @@ def lancar_fichas_viasell():
                                     total_valor += valor_reg
                                 except:
                                     pass
-                        
+                        valor_hora_cfg = float(dados_extraidos.get('valor_hora', 180.0))
+
+                        seg_faturaveis = 0
+                        seg_nao_faturaveis = 0
+                        registros_faturaveis = 0
+
+                        for idx in registros_com_tarefa_final.keys():
+                            reg = registros[idx]
+                            seg = _hms_to_seconds_safe(reg.get('total_hrs', '00:00:00'))
+                            if reg.get('faturavel', True):
+                                registros_faturaveis += 1
+                                seg_faturaveis += seg
+                            else:
+                                seg_nao_faturaveis += seg
+
+                        seg_total = seg_faturaveis + seg_nao_faturaveis
+
+# Valor considera apenas horas faturáveis
+                        horas_faturaveis = seg_faturaveis / 3600.0
+                        valor_total = horas_faturaveis * valor_hora_cfg
+
+                        hms_fat  = _seconds_to_hms(seg_faturaveis)
+                        hms_nfat = _seconds_to_hms(seg_nao_faturaveis)
+                        hms_tot  = _seconds_to_hms(seg_total)
                         # Mostrar resumo final da ficha
                         col_resumo, col_botao_final = st.columns([2, 1])
                         
@@ -1651,6 +1724,9 @@ def lancar_fichas_viasell():
                                 st.markdown(f"""
                                 **💰 Resumo Financeiro:**
                                 - **Valor/Hora:** R$ {dados_extraidos.get('valor_hora', 180.0):.2f}
+                                - **Horas Faturáveis:** {hms_fat} ({seg_faturaveis // 60} min)
+                                - **Horas Não Faturáveis:** {hms_nfat} ({seg_nao_faturaveis // 60} min)
+                                - **Horas Totais (FAT + NF):** {hms_tot} ({seg_total // 60} min)
                                 - **Registros Faturáveis:** {registros_faturáveis}
                                 - **Valor Total Estimado:** R$ {total_valor:.2f}
                                 - **Registros p/ Lançar:** {len(registros_com_tarefa_final)}
@@ -2059,7 +2135,7 @@ def configuracoes_sistema():
         st.rerun()
 
     # ===== PRÉ-SELEÇÃO DE TAREFAS POR PROJETO (Whitelist) =====
-    st.subheader("Pré-seleção de tarefas por projeto")
+    st.subheader("🗂 Pré-seleção de tarefas por projeto")
 
     with st.expander("Configurar tarefas que podem receber apontamento (por projeto)", expanded=False):
         # 1) Projeto
